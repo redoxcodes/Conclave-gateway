@@ -122,8 +122,12 @@ bot.start(async (ctx) => {
     }
 
     try {
+      // Link dies after one use OR after 90 seconds, whichever comes first.
+      const expiresAt = Math.floor(Date.now() / 1000) + 90;
+
       const invite = await bot.telegram.createChatInviteLink(TELEGRAM_GROUP_ID, {
         member_limit: 1,
+        expire_date: expiresAt,
         name: `invite-${handle}`.slice(0, 32),
       });
 
@@ -131,8 +135,10 @@ bot.start(async (ctx) => {
 
       return ctx.reply(
         `✅ Verified as @${record.username} — you're on the list!\n\n` +
-        `Here's your personal invite link (works once, don't share it):\n` +
-        `${invite.invite_link}`
+        `⏱ Join within 90 seconds — this link expires after that, ` +
+        `and only works once. Don't share it.\n\n` +
+        `${invite.invite_link}\n\n` +
+        `If it expires, just send /start again for a fresh one.`
       );
     } catch (err) {
       console.error('Invite link failed:', err.message);
