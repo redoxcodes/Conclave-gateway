@@ -64,6 +64,34 @@ async function getMembers() {
 
 // ---------- Core: remove anyone not on the active list ----------
 
+// Kick = ban then immediately unban, so they can rejoin later if they
+// resubscribe. If that unban fails they stay banned and can never get
+// back in, so retry a few times before giving up.
+async function kickMember(tgId, handle) {
+  await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await bot.telegram.unbanChatMember(TELEGRAM_GROUP_ID, Number(tgId), {
+        only_if_banned: true,
+      });
+      return true;
+    } catch (err) {
+      console.error(
+        `Unban attempt ${attempt} failed for ${tgId} (@${handle}):`,
+        err.message
+      );
+      await sleep(1000 * attempt);
+    }
+  }
+
+  console.error(
+    `STILL BANNED: ${tgId} (@${handle}) — unban failed 3 times. ` +
+    `Unban manually in group settings or they cannot rejoin.`
+  );
+  return false;
+}
+
 async function runCheck() {
   const activeList = await getActiveList();
   if (activeList.size === 0) {
@@ -72,20 +100,21 @@ async function runCheck() {
 
   const members = await getMembers();
   const removed = [];
+  const stuckBanned = [];
   let checked = 0;
 
   for (const tgId of members) {
     const record = await redis.get(`verified:${tgId}`);
-    if (!record) continue;
+    if (!record) continue; // never finished verifying — ignore
 
     checked++;
     const handle = normalize(record.username);
 
     if (!activeList.has(handle)) {
       try {
-        await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
-        await bot.telegram.unbanChatMember(TELEGRAM_GROUP_ID, Number(tgId));
+        const unbanned = await kickMember(tgId, handle);
         removed.push(handle);
+        if (!unbanned) stuckBanned.push(handle);
       } catch (err) {
         console.error(`Could not remove ${tgId} (@${handle}):`, err.message);
       }
@@ -93,7 +122,7 @@ async function runCheck() {
     }
   }
 
-  return { skipped: false, checked, removed };
+  return { skipped: false, checked, removed, stuckBanned };
 }
 
 // ---------- Telegram bot ----------
@@ -183,6 +212,12 @@ bot.command('setlist', async (ctx) => {
     `Removed: ${result.removed.length}`;
   if (result.removed.length) {
     msg += '\n\nRemoved: ' + result.removed.map((h) => '@' + h).join(', ');
+  }
+  if (result.stuckBanned && result.stuckBanned.length) {
+    msg +=
+      '\n\n⚠️ Could not unban these — they cannot rejoin until you ' +
+      'unban them manually in group settings:\n' +
+      result.stuckBanned.map((h) => '@' + h).join(', ');
   }
   return ctx.reply(msg);
 });
@@ -280,11 +315,18 @@ app.get('/cron/daily-check', async (req, res) => {
   console.log(`Daily check: checked ${result.checked}, removed ${result.removed.length}`);
 
   if (result.removed.length) {
-    const msg =
+    let msg =
       `Daily check complete.\n` +
       `Checked: ${result.checked}\n` +
       `Removed: ${result.removed.length}\n\n` +
       'Removed: ' + result.removed.map((h) => '@' + h).join(', ');
+
+    if (result.stuckBanned && result.stuckBanned.length) {
+      msg +=
+        '\n\n⚠️ Could not unban these — they cannot rejoin until you ' +
+        'unban them manually in group settings:\n' +
+        result.stuckBanned.map((h) => '@' + h).join(', ');
+    }
 
     for (const adminId of ADMIN_IDS) {
       try {
