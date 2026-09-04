@@ -12,6 +12,9 @@ const {
   UPSTASH_REDIS_REST_TOKEN,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_BOT_USERNAME,
+  TELEGRAM_GROUP_ID,
+  ADMIN_USER_IDS,
+  CRON_SECRET,
   PUBLIC_BASE_URL,
   PORT = 3000,
 } = process.env;
@@ -29,32 +32,180 @@ const twitterClient = new TwitterApi({
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const app = express();
 
+const ADMIN_IDS = (ADMIN_USER_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
+
+const normalize = (h) => h.trim().replace(/^@/, '').toLowerCase();
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------- Redis helpers ----------
+
+async function getActiveList() {
+  const list = await redis.get('active_list');
+  return new Set(list || []);
+}
+
+async function saveActiveList(handles) {
+  await redis.set('active_list', [...handles]);
+}
+
+async function addMember(tgId) {
+  await redis.sadd('members', String(tgId));
+}
+
+async function getMembers() {
+  return (await redis.smembers('members')) || [];
+}
+
+// ---------- Core: remove anyone not on the active list ----------
+
+async function runCheck() {
+  const activeList = await getActiveList();
+  if (activeList.size === 0) {
+    return { skipped: true, reason: 'No active list saved yet.' };
+  }
+
+  const members = await getMembers();
+  const removed = [];
+  let checked = 0;
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    checked++;
+    const handle = normalize(record.username);
+
+    if (!activeList.has(handle)) {
+      try {
+        await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
+        await bot.telegram.unbanChatMember(TELEGRAM_GROUP_ID, Number(tgId));
+        removed.push(handle);
+      } catch (err) {
+        console.error(`Could not remove ${tgId} (@${handle}):`, err.message);
+      }
+      await sleep(350);
+    }
+  }
+
+  return { skipped: false, checked, removed };
+}
+
 // ---------- Telegram bot ----------
 
 bot.start(async (ctx) => {
-  const payload = ctx.startPayload; // text after /start
+  const payload = ctx.startPayload;
 
-  // Case 1: user just verified via X, redirected back with verified_<tgId>
   if (payload && payload.startsWith('verified_')) {
     const tgId = payload.replace('verified_', '');
     const record = await redis.get(`verified:${tgId}`);
-    if (record) {
-      return ctx.reply(`✅ You're verified as @${record.username} on X. Welcome!`);
+
+    if (!record) {
+      return ctx.reply('⚠️ Verification not found yet. Try tapping the link again.');
     }
-    return ctx.reply('⚠️ Verification not found yet. Try tapping the link again.');
+
+    const handle = normalize(record.username);
+    const activeList = await getActiveList();
+
+    if (!activeList.has(handle)) {
+      return ctx.reply(
+        `✅ Verified as @${record.username}.\n\n` +
+        `❌ But that account isn't on the current subscriber list, ` +
+        `so I can't let you in yet.\n\n` +
+        `If you just subscribed, give it a moment and try /start again.`
+      );
+    }
+
+    try {
+      const invite = await bot.telegram.createChatInviteLink(TELEGRAM_GROUP_ID, {
+        member_limit: 1,
+        name: `invite-${handle}`.slice(0, 32),
+      });
+
+      await addMember(tgId);
+
+      return ctx.reply(
+        `✅ Verified as @${record.username} — you're on the list!\n\n` +
+        `Here's your personal invite link (works once, don't share it):\n` +
+        `${invite.invite_link}`
+      );
+    } catch (err) {
+      console.error('Invite link failed:', err.message);
+      return ctx.reply(
+        '✅ Verified, but I could not create your invite link. ' +
+        'Please contact the admin.'
+      );
+    }
   }
 
-  // Case 2: fresh /start — send them the verify link
   const authUrl = `${PUBLIC_BASE_URL}/auth/x/start?tg_id=${ctx.from.id}`;
+  return ctx.reply('Welcome! Verify your X account to continue.', {
+    reply_markup: {
+      inline_keyboard: [[{ text: 'Verify with X', url: authUrl }]],
+    },
+  });
+});
+
+// ---------- Admin commands ----------
+
+bot.command('setlist', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const lines = ctx.message.text.split('\n').slice(1).filter((l) => l.trim());
+  if (lines.length === 0) {
+    return ctx.reply(
+      'Send it like this:\n\n/setlist\nhandle1\nhandle2\nhandle3'
+    );
+  }
+
+  const handles = new Set(lines.map(normalize));
+  await saveActiveList(handles);
+
+  await ctx.reply(`List saved: ${handles.size} handles. Running check now...`);
+
+  const result = await runCheck();
+  if (result.skipped) return ctx.reply(result.reason);
+
+  let msg =
+    `Check complete.\n` +
+    `Checked: ${result.checked} verified members\n` +
+    `Removed: ${result.removed.length}`;
+  if (result.removed.length) {
+    msg += '\n\nRemoved: ' + result.removed.map((h) => '@' + h).join(', ');
+  }
+  return ctx.reply(msg);
+});
+
+bot.command('status', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const activeList = await getActiveList();
+  const members = await getMembers();
+
   return ctx.reply(
-    'Welcome! Verify your X account to continue.',
-    {
-      reply_markup: {
-        inline_keyboard: [[{ text: 'Verify with X', url: authUrl }]],
-      },
-    }
+    `Verified members: ${members.length}\n` +
+    `Active list: ${activeList.size} handles`
   );
 });
+
+bot.command('showlist', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const activeList = await getActiveList();
+  if (activeList.size === 0) return ctx.reply('No list saved yet.');
+
+  return ctx.reply(
+    `Current list (${activeList.size}):\n` +
+    [...activeList].map((h) => '@' + h).join('\n')
+  );
+});
+
+bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
 bot.launch();
 
@@ -69,7 +220,6 @@ app.get('/auth/x/start', async (req, res) => {
     { scope: ['tweet.read', 'users.read'] }
   );
 
-  // Stash the PKCE verifier + tg_id for 10 minutes, keyed by state
   await redis.set(`oauth:${state}`, { codeVerifier, tgId }, { ex: 600 });
 
   res.redirect(url);
@@ -106,6 +256,45 @@ app.get('/auth/x/callback', async (req, res) => {
     res.status(500).send('Verification failed. Please try again.');
   }
 });
+
+// ---------- Cron endpoint (the daily check) ----------
+
+app.get('/cron/daily-check', async (req, res) => {
+  if (req.query.key !== CRON_SECRET) {
+    return res.status(403).send('Forbidden');
+  }
+
+  const result = await runCheck();
+
+  if (result.skipped) {
+    console.log('Daily check skipped:', result.reason);
+    return res.send('Skipped: ' + result.reason);
+  }
+
+  console.log(`Daily check: checked ${result.checked}, removed ${result.removed.length}`);
+
+  if (result.removed.length) {
+    const msg =
+      `Daily check complete.\n` +
+      `Checked: ${result.checked}\n` +
+      `Removed: ${result.removed.length}\n\n` +
+      'Removed: ' + result.removed.map((h) => '@' + h).join(', ');
+
+    for (const adminId of ADMIN_IDS) {
+      try {
+        await bot.telegram.sendMessage(adminId, msg);
+      } catch (err) {
+        console.error('Could not notify admin:', err.message);
+      }
+    }
+  }
+
+  res.send(`OK — checked ${result.checked}, removed ${result.removed.length}`);
+});
+
+// ---------- Keepalive ----------
+
+app.get('/ping', (req, res) => res.send('pong'));
 
 app.get('/', (req, res) => res.send('X verify bot is running.'));
 
