@@ -1,20 +1,3 @@
-Now the join handler — this is the part that actually closes the hole.
-
-Let me also use the shared notify helper in the daily check to avoid duplicate code.
-
-The bot now watches every join and removes anyone who isn't the person the link was issued to. It also catches people joining with no bot link at all, and DMs you when it fires so you know which subscriber is sharing links.
-
-**One extra step this time** — the bot needs a group permission it may not have:
-
-Group → Administrators → Conclave's gateway → make sure **Add Users / Invite Users via Link** is on, alongside Ban Users. Without admin rights it won't receive join events.
-
-**Steps:**
-
-1. **https://github.com/redoxcodes/Conclave-gateway/blob/main/server.js** → pencil → select all → delete → paste below → commit
-2. Wait for redeploy
-3. Test: get a link on one account, forward it to a third account, have that account join — it should be kicked within seconds and you should get a DM naming who the link belonged to
-
-```javascript
 import 'dotenv/config';
 import express from 'express';
 import { TwitterApi } from 'twitter-api-v2';
@@ -465,4 +448,3 @@ app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-```
