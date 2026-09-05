@@ -168,6 +168,8 @@ bot.start(async (ctx) => {
         `✅ Verified as @${record.username}.\n\n` +
         `❌ But that account isn't on the current subscriber list, ` +
         `so I can't let you in yet.\n\n` +
+        `Subscribe here to gain access:\n` +
+        `https://x.com/atitty\n\n` +
         `If you just subscribed, give it a moment and try /start again.`
       );
     }
@@ -189,8 +191,7 @@ bot.start(async (ctx) => {
         `✅ Verified as @${record.username} — you're on the list!\n\n` +
         `⏱ Join within 3 minutes — this link expires after that, ` +
         `and only works once. Don't share it.\n\n` +
-        `${invite.invite_link}\n\n` +
-        `If it expires, just send /start again for a fresh one.`
+        `${invite.invite_link}`
       );
     } catch (err) {
       console.error('Invite link failed:', err.message);
@@ -202,11 +203,17 @@ bot.start(async (ctx) => {
   }
 
   const authUrl = `${PUBLIC_BASE_URL}/auth/x/start?tg_id=${ctx.from.id}`;
-  return ctx.reply('Welcome! Verify your X account to continue.', {
-    reply_markup: {
-      inline_keyboard: [[{ text: 'Verify with X', url: authUrl }]],
-    },
-  });
+  return ctx.reply(
+    'Welcome to The Conclave.\n\n' +
+    'Access is for X subscribers only. Verify your X account below.\n\n' +
+    'Not subscribed yet? Subscribe here first:\n' +
+    'https://x.com/atitty',
+    {
+      reply_markup: {
+        inline_keyboard: [[{ text: 'Verify with X', url: authUrl }]],
+      },
+    }
+  );
 });
 
 // ---------- Admin commands ----------
@@ -272,10 +279,6 @@ bot.command('showlist', async (ctx) => {
 bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
 // ---------- Gatecrasher check ----------
-//
-// An invite link is single-use, but nothing stops a subscriber forwarding
-// it to a friend who uses it first. So we check that whoever walked
-// through the door is the person the link was minted for.
 
 bot.on('chat_member', async (ctx) => {
   try {
@@ -343,8 +346,6 @@ bot.on('chat_member', async (ctx) => {
   }
 });
 
-// allowed_updates must include chat_member — Telegram does not send it
-// by default, so without this the gatecrasher check never fires.
 bot.launch({
   allowedUpdates: [
     'message',
