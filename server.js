@@ -1,3 +1,20 @@
+Now the join handler — this is the part that actually closes the hole.
+
+Let me also use the shared notify helper in the daily check to avoid duplicate code.
+
+The bot now watches every join and removes anyone who isn't the person the link was issued to. It also catches people joining with no bot link at all, and DMs you when it fires so you know which subscriber is sharing links.
+
+**One extra step this time** — the bot needs a group permission it may not have:
+
+Group → Administrators → Conclave's gateway → make sure **Add Users / Invite Users via Link** is on, alongside Ban Users. Without admin rights it won't receive join events.
+
+**Steps:**
+
+1. **https://github.com/redoxcodes/Conclave-gateway/blob/main/server.js** → pencil → select all → delete → paste below → commit
+2. Wait for redeploy
+3. Test: get a link on one account, forward it to a third account, have that account join — it should be kicked within seconds and you should get a DM naming who the link belonged to
+
+```javascript
 import 'dotenv/config';
 import express from 'express';
 import { TwitterApi } from 'twitter-api-v2';
@@ -62,11 +79,23 @@ async function getMembers() {
   return (await redis.smembers('members')) || [];
 }
 
+// When we mint an invite link we remember who it was for, so that when
+// someone joins with it we can check they are that person and not a
+// friend the link was forwarded to.
+async function rememberInvite(inviteLink, tgId, handle) {
+  await redis.set(
+    `invite:${inviteLink}`,
+    { tgId: String(tgId), handle },
+    { ex: 3600 }
+  );
+}
+
+async function lookupInvite(inviteLink) {
+  return await redis.get(`invite:${inviteLink}`);
+}
+
 // ---------- Core: remove anyone not on the active list ----------
 
-// Kick = ban then immediately unban, so they can rejoin later if they
-// resubscribe. If that unban fails they stay banned and can never get
-// back in, so retry a few times before giving up.
 async function kickMember(tgId, handle) {
   await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
 
@@ -105,7 +134,7 @@ async function runCheck() {
 
   for (const tgId of members) {
     const record = await redis.get(`verified:${tgId}`);
-    if (!record) continue; // never finished verifying — ignore
+    if (!record) continue;
 
     checked++;
     const handle = normalize(record.username);
@@ -123,6 +152,16 @@ async function runCheck() {
   }
 
   return { skipped: false, checked, removed, stuckBanned };
+}
+
+async function notifyAdmins(text) {
+  for (const adminId of ADMIN_IDS) {
+    try {
+      await bot.telegram.sendMessage(adminId, text);
+    } catch (err) {
+      console.error('Could not notify admin:', err.message);
+    }
+  }
 }
 
 // ---------- Telegram bot ----------
@@ -161,6 +200,7 @@ bot.start(async (ctx) => {
       });
 
       await addMember(tgId);
+      await rememberInvite(invite.invite_link, tgId, handle);
 
       return ctx.reply(
         `✅ Verified as @${record.username} — you're on the list!\n\n` +
@@ -248,7 +288,88 @@ bot.command('showlist', async (ctx) => {
 
 bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
-bot.launch();
+// ---------- Gatecrasher check ----------
+//
+// An invite link is single-use, but nothing stops a subscriber forwarding
+// it to a friend who uses it first. So we check that whoever walked
+// through the door is the person the link was minted for.
+
+bot.on('chat_member', async (ctx) => {
+  try {
+    const update = ctx.chatMember;
+    if (String(update.chat.id) !== String(TELEGRAM_GROUP_ID)) return;
+
+    const wasIn = ['member', 'administrator', 'creator'].includes(
+      update.old_chat_member.status
+    );
+    const isIn = ['member', 'administrator', 'creator'].includes(
+      update.new_chat_member.status
+    );
+
+    if (wasIn || !isIn) return;
+
+    const joiner = update.new_chat_member.user;
+    const joinerId = String(joiner.id);
+
+    if (isAdmin(joinerId)) return;
+    if (joiner.is_bot) return;
+
+    const usedLink = update.invite_link && update.invite_link.invite_link;
+
+    if (!usedLink) {
+      console.error(`Kicking ${joinerId}: joined without a bot invite link.`);
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — joined without going through verification.`
+      );
+      return;
+    }
+
+    const record = await lookupInvite(usedLink);
+
+    if (!record) {
+      console.error(`Kicking ${joinerId}: unrecognised invite link.`);
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — used an invite link I don't recognise.`
+      );
+      return;
+    }
+
+    if (record.tgId !== joinerId) {
+      console.error(
+        `Kicking ${joinerId}: used a link issued to ${record.tgId} (@${record.handle}).`
+      );
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — used a link that was issued to @${record.handle}.\n\n` +
+        `That link was forwarded. You may want to check on @${record.handle}.`
+      );
+      return;
+    }
+
+    await redis.del(`invite:${usedLink}`);
+  } catch (err) {
+    console.error('chat_member handler failed:', err.message);
+  }
+});
+
+// allowed_updates must include chat_member — Telegram does not send it
+// by default, so without this the gatecrasher check never fires.
+bot.launch({
+  allowedUpdates: [
+    'message',
+    'callback_query',
+    'chat_member',
+    'my_chat_member',
+  ],
+});
 
 // ---------- OAuth routes ----------
 
@@ -328,13 +449,7 @@ app.get('/cron/daily-check', async (req, res) => {
         result.stuckBanned.map((h) => '@' + h).join(', ');
     }
 
-    for (const adminId of ADMIN_IDS) {
-      try {
-        await bot.telegram.sendMessage(adminId, msg);
-      } catch (err) {
-        console.error('Could not notify admin:', err.message);
-      }
-    }
+    await notifyAdmins(msg);
   }
 
   res.send(`OK — checked ${result.checked}, removed ${result.removed.length}`);
@@ -350,3 +465,4 @@ app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+```
