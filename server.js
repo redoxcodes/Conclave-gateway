@@ -700,6 +700,33 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
+// Telegram posts "X joined the group" / "X was removed" notices. They
+// pile up fast with a gatekeeper bot, so we delete them after a moment.
+bot.on('message', async (ctx, next) => {
+  const msg = ctx.message;
+
+  const isServiceMessage =
+    msg.new_chat_members ||
+    msg.left_chat_member ||
+    msg.new_chat_title ||
+    msg.new_chat_photo ||
+    msg.pinned_message;
+
+  if (!isServiceMessage) return next();
+  if (String(msg.chat.id) !== String(TELEGRAM_GROUP_ID)) return next();
+
+  setTimeout(async () => {
+    try {
+      await ctx.telegram.deleteMessage(msg.chat.id, msg.message_id);
+    } catch (err) {
+      // Usually means it was already gone, or the bot lacks Delete rights.
+      console.error('Could not delete service message:', err.message);
+    }
+  }, 10000);
+
+  return next();
+});
+
 // ---------- Gatecrasher check ----------
 //
 // Fires whenever someone joins. An invite link is single-use, but nothing
