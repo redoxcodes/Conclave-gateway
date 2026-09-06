@@ -12,9 +12,9 @@ const {
   UPSTASH_REDIS_REST_TOKEN,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_BOT_USERNAME,
-  TELEGRAM_GROUP_ID,
-  ADMIN_USER_IDS,
-  CRON_SECRET,
+  TELEGRAM_GROUP_ID,      // NEW: your group's chat id, e.g. -1001234567890
+  ADMIN_USER_IDS,         // NEW: your TG user id(s), comma separated
+  CRON_SECRET,            // NEW: any long random string you invent
   PUBLIC_BASE_URL,
   PORT = 3000,
 } = process.env;
@@ -39,12 +39,15 @@ const ADMIN_IDS = (ADMIN_USER_IDS || '')
 
 const isAdmin = (tgId) => ADMIN_IDS.includes(String(tgId));
 
+// Strip @ and lowercase so "@BigMike" and "bigmike" are treated the same.
 const normalize = (h) => h.trim().replace(/^@/, '').toLowerCase();
 
+// Small pause so Telegram doesn't rate-limit us during big removals.
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------- Redis helpers ----------
 
+// The current active subscriber list. Overwritten each time you /setlist.
 async function getActiveList() {
   const list = await redis.get('active_list');
   return new Set(list || []);
@@ -54,6 +57,8 @@ async function saveActiveList(handles) {
   await redis.set('active_list', [...handles]);
 }
 
+// We keep a set of every tg_id that has verified, so the daily check
+// knows who to loop through.
 async function addMember(tgId) {
   await redis.sadd('members', String(tgId));
 }
@@ -69,7 +74,7 @@ async function rememberInvite(inviteLink, tgId, handle) {
   await redis.set(
     `invite:${inviteLink}`,
     { tgId: String(tgId), handle },
-    { ex: 3600 }
+    { ex: 3600 } // an hour is plenty; the link itself dies in 3 minutes
   );
 }
 
@@ -79,6 +84,9 @@ async function lookupInvite(inviteLink) {
 
 // ---------- Core: remove anyone not on the active list ----------
 
+// Kick = ban then immediately unban, so they can rejoin later if they
+// resubscribe. If that unban fails they stay banned and can never get
+// back in, so retry a few times before giving up.
 async function kickMember(tgId, handle) {
   await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
 
@@ -117,7 +125,7 @@ async function runCheck() {
 
   for (const tgId of members) {
     const record = await redis.get(`verified:${tgId}`);
-    if (!record) continue;
+    if (!record) continue; // never finished verifying — ignore
 
     checked++;
     const handle = normalize(record.username);
@@ -137,21 +145,12 @@ async function runCheck() {
   return { skipped: false, checked, removed, stuckBanned };
 }
 
-async function notifyAdmins(text) {
-  for (const adminId of ADMIN_IDS) {
-    try {
-      await bot.telegram.sendMessage(adminId, text);
-    } catch (err) {
-      console.error('Could not notify admin:', err.message);
-    }
-  }
-}
-
 // ---------- Telegram bot ----------
 
 bot.start(async (ctx) => {
   const payload = ctx.startPayload;
 
+  // Case 1: they just came back from verifying with X
   if (payload && payload.startsWith('verified_')) {
     const tgId = payload.replace('verified_', '');
     const record = await redis.get(`verified:${tgId}`);
@@ -163,6 +162,7 @@ bot.start(async (ctx) => {
     const handle = normalize(record.username);
     const activeList = await getActiveList();
 
+    // Gate: are they actually on your subscriber list?
     if (!activeList.has(handle)) {
       return ctx.reply(
         `✅ Verified as @${record.username}.\n\n` +
@@ -174,6 +174,7 @@ bot.start(async (ctx) => {
       );
     }
 
+    // They're on the list — give them a one-time invite link.
     try {
       // Link dies after one use OR after 3 minutes, whichever comes first.
       const expiresAt = Math.floor(Date.now() / 1000) + 180;
@@ -202,6 +203,7 @@ bot.start(async (ctx) => {
     }
   }
 
+  // Case 2: fresh /start — send them off to verify
   const authUrl = `${PUBLIC_BASE_URL}/auth/x/start?tg_id=${ctx.from.id}`;
   return ctx.reply(
     'Welcome to The Conclave.\n\n' +
@@ -218,6 +220,12 @@ bot.start(async (ctx) => {
 
 // ---------- Admin commands ----------
 
+// /setlist
+// handle1
+// handle2
+// handle3
+//
+// Overwrites the saved list, then runs a check immediately.
 bot.command('setlist', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
 
@@ -229,8 +237,290 @@ bot.command('setlist', async (ctx) => {
   }
 
   const handles = new Set(lines.map(normalize));
-  await saveActiveList(handles);
 
+  // Check the damage before doing it.
+  const wouldRemove = await previewRemovals(handles);
+
+  if (wouldRemove.length > BULK_REMOVAL_THRESHOLD) {
+    pendingSetlist.set(String(ctx.from.id), handles);
+    return ctx.reply(
+      `⚠️ Hold on — this would remove ${wouldRemove.length} people:\n\n` +
+      wouldRemove.map((h) => '@' + h).join(', ') +
+      `\n\nNew list has ${handles.size} handles.\n\n` +
+      `If that's right, send /confirm. Otherwise /cancel.`
+    );
+  }
+
+  return applySetlist(ctx, handles);
+});
+
+bot.command('confirm', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const handles = pendingSetlist.get(String(ctx.from.id));
+  if (!handles) return ctx.reply('Nothing waiting for confirmation.');
+
+  pendingSetlist.delete(String(ctx.from.id));
+  return applySetlist(ctx, handles);
+});
+
+bot.command('cancel', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  if (pendingSetlist.delete(String(ctx.from.id))) {
+    return ctx.reply('Cancelled. List unchanged.');
+  }
+  return ctx.reply('Nothing to cancel.');
+});
+
+// Add one handle without touching the rest of the list.
+bot.command('addsub', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const arg = ctx.message.text.split(' ')[1];
+  if (!arg) return ctx.reply('Usage: /addsub their_x_handle');
+
+  const handle = normalize(arg);
+  const activeList = await getActiveList();
+
+  if (activeList.has(handle)) {
+    return ctx.reply(`@${handle} is already on the list.`);
+  }
+
+  activeList.add(handle);
+  await saveActiveList(activeList);
+
+  return ctx.reply(
+    `✅ Added @${handle}.\nList is now ${activeList.size} handles.\n\n` +
+    `They can send /start to the bot to get in.`
+  );
+});
+
+// Remove one handle, and kick them if they're in the group.
+bot.command('removesub', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const arg = ctx.message.text.split(' ')[1];
+  if (!arg) return ctx.reply('Usage: /removesub their_x_handle');
+
+  const handle = normalize(arg);
+  const activeList = await getActiveList();
+
+  if (!activeList.has(handle)) {
+    return ctx.reply(`@${handle} isn't on the list.`);
+  }
+
+  activeList.delete(handle);
+  await saveActiveList(activeList);
+
+  await ctx.reply(
+    `Removed @${handle} from the list (${activeList.size} left). Checking group...`
+  );
+
+  const result = await runCheck();
+  if (result.skipped) return ctx.reply(result.reason);
+
+  if (result.removed.length) {
+    return ctx.reply(
+      `✅ Kicked from the group: ` +
+      result.removed.map((h) => '@' + h).join(', ')
+    );
+  }
+  return ctx.reply(`@${handle} wasn't in the group, so nothing to kick.`);
+});
+
+// Look someone up — for when a member says they can't get in.
+bot.command('whois', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const arg = ctx.message.text.split(' ')[1];
+  if (!arg) return ctx.reply('Usage: /whois their_x_handle');
+
+  const handle = normalize(arg);
+  const activeList = await getActiveList();
+  const onList = activeList.has(handle);
+
+  const members = await getMembers();
+  let verifiedAs = null;
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (record && normalize(record.username) === handle) {
+      verifiedAs = { tgId, ...record };
+      break;
+    }
+  }
+
+  let msg = `@${handle}\n\n`;
+  msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
+
+  if (verifiedAs) {
+    msg += `✅ Verified (Telegram ID ${verifiedAs.tgId})\n`;
+    msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
+  } else {
+    msg += `❌ Has never verified with the bot\n`;
+  }
+
+  msg += `\n`;
+  if (onList && verifiedAs) {
+    msg += `They should have access. If they don't, check they aren't in ` +
+           `Removed Users in group settings.`;
+  } else if (onList && !verifiedAs) {
+    msg += `On the list but hasn't verified — tell them to send /start to the bot.`;
+  } else if (!onList && verifiedAs) {
+    msg += `Verified but not on the list. Use /addsub ${handle} if they've subscribed.`;
+  } else {
+    msg += `Nothing on record for them at all.`;
+  }
+
+  return ctx.reply(msg);
+});
+
+// Back up the list, in case the database is ever wiped.
+bot.command('export', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const activeList = await getActiveList();
+  if (activeList.size === 0) return ctx.reply('No list saved yet.');
+
+  // Formatted so you can paste it straight back into /setlist.
+  return ctx.reply(`/setlist\n` + [...activeList].join('\n'));
+});
+
+// /status — quick health check
+bot.command('status', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const activeList = await getActiveList();
+  const members = await getMembers();
+
+  return ctx.reply(
+    `Verified members: ${members.length}\n` +
+    `Active list: ${activeList.size} handles`
+  );
+});
+
+// /showlist — see what's currently saved
+bot.command('showlist', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const activeList = await getActiveList();
+  if (activeList.size === 0) return ctx.reply('No list saved yet.');
+
+  return ctx.reply(
+    `Current list (${activeList.size}):\n` +
+    [...activeList].map((h) => '@' + h).join('\n')
+  );
+});
+
+// /myid — tells you your Telegram user id (useful for setting ADMIN_USER_IDS)
+bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
+
+// ---------- Gatecrasher check ----------
+//
+// Fires whenever someone joins. An invite link is single-use, but nothing
+// stops a subscriber forwarding it to a friend who uses it first. So we
+// check that whoever walked through the door is the person the link was
+// minted for, and remove them if not.
+
+bot.on('chat_member', async (ctx) => {
+  try {
+    const update = ctx.chatMember;
+    if (String(update.chat.id) !== String(TELEGRAM_GROUP_ID)) return;
+
+    const wasIn = ['member', 'administrator', 'creator'].includes(
+      update.old_chat_member.status
+    );
+    const isIn = ['member', 'administrator', 'creator'].includes(
+      update.new_chat_member.status
+    );
+
+    // Only care about someone newly joining.
+    if (wasIn || !isIn) return;
+
+    const joiner = update.new_chat_member.user;
+    const joinerId = String(joiner.id);
+
+    // Admins and the bot itself are exempt.
+    if (isAdmin(joinerId)) return;
+    if (joiner.is_bot) return;
+
+    const usedLink = update.invite_link && update.invite_link.invite_link;
+
+    // Joined without a bot-issued link at all (e.g. the group's primary
+    // link, or added by another member) — they never verified.
+    if (!usedLink) {
+      console.error(`Kicking ${joinerId}: joined without a bot invite link.`);
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — joined without going through verification.`
+      );
+      return;
+    }
+
+    const record = await lookupInvite(usedLink);
+
+    // Link we don't recognise — treat as untrusted.
+    if (!record) {
+      console.error(`Kicking ${joinerId}: unrecognised invite link.`);
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — used an invite link I don't recognise.`
+      );
+      return;
+    }
+
+    // The link was issued to someone else — this is a forwarded link.
+    if (record.tgId !== joinerId) {
+      console.error(
+        `Kicking ${joinerId}: used a link issued to ${record.tgId} (@${record.handle}).`
+      );
+      await kickMember(joinerId, joiner.username || joinerId);
+      await notifyAdmins(
+        `🚫 Removed ${joiner.first_name || joinerId}` +
+        (joiner.username ? ` (@${joiner.username})` : '') +
+        ` — used a link that was issued to @${record.handle}.\n\n` +
+        `That link was forwarded. You may want to check on @${record.handle}.`
+      );
+      return;
+    }
+
+    // Correct person, correct link — let them stay. The link is consumed
+    // now, so drop the record.
+    await redis.del(`invite:${usedLink}`);
+  } catch (err) {
+    console.error('chat_member handler failed:', err.message);
+  }
+});
+
+// If a /setlist would remove more than this many people at once, ask for
+// confirmation first. Guards against a paste error emptying the group.
+const BULK_REMOVAL_THRESHOLD = 5;
+
+// Pending confirmations, keyed by admin id. In memory, short-lived.
+const pendingSetlist = new Map();
+
+// Who would be removed if this became the active list? Read-only.
+async function previewRemovals(newList) {
+  const members = await getMembers();
+  const wouldGo = [];
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+    const handle = normalize(record.username);
+    if (!newList.has(handle)) wouldGo.push(handle);
+  }
+
+  return wouldGo;
+}
+
+async function applySetlist(ctx, handles) {
+  await saveActiveList(handles);
   await ctx.reply(`List saved: ${handles.size} handles. Running check now...`);
 
   const result = await runCheck();
@@ -250,102 +540,20 @@ bot.command('setlist', async (ctx) => {
       result.stuckBanned.map((h) => '@' + h).join(', ');
   }
   return ctx.reply(msg);
-});
+}
 
-bot.command('status', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
-
-  const activeList = await getActiveList();
-  const members = await getMembers();
-
-  return ctx.reply(
-    `Verified members: ${members.length}\n` +
-    `Active list: ${activeList.size} handles`
-  );
-});
-
-bot.command('showlist', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
-
-  const activeList = await getActiveList();
-  if (activeList.size === 0) return ctx.reply('No list saved yet.');
-
-  return ctx.reply(
-    `Current list (${activeList.size}):\n` +
-    [...activeList].map((h) => '@' + h).join('\n')
-  );
-});
-
-bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
-
-// ---------- Gatecrasher check ----------
-
-bot.on('chat_member', async (ctx) => {
-  try {
-    const update = ctx.chatMember;
-    if (String(update.chat.id) !== String(TELEGRAM_GROUP_ID)) return;
-
-    const wasIn = ['member', 'administrator', 'creator'].includes(
-      update.old_chat_member.status
-    );
-    const isIn = ['member', 'administrator', 'creator'].includes(
-      update.new_chat_member.status
-    );
-
-    if (wasIn || !isIn) return;
-
-    const joiner = update.new_chat_member.user;
-    const joinerId = String(joiner.id);
-
-    if (isAdmin(joinerId)) return;
-    if (joiner.is_bot) return;
-
-    const usedLink = update.invite_link && update.invite_link.invite_link;
-
-    if (!usedLink) {
-      console.error(`Kicking ${joinerId}: joined without a bot invite link.`);
-      await kickMember(joinerId, joiner.username || joinerId);
-      await notifyAdmins(
-        `🚫 Removed ${joiner.first_name || joinerId}` +
-        (joiner.username ? ` (@${joiner.username})` : '') +
-        ` — joined without going through verification.`
-      );
-      return;
+async function notifyAdmins(text) {
+  for (const adminId of ADMIN_IDS) {
+    try {
+      await bot.telegram.sendMessage(adminId, text);
+    } catch (err) {
+      console.error('Could not notify admin:', err.message);
     }
-
-    const record = await lookupInvite(usedLink);
-
-    if (!record) {
-      console.error(`Kicking ${joinerId}: unrecognised invite link.`);
-      await kickMember(joinerId, joiner.username || joinerId);
-      await notifyAdmins(
-        `🚫 Removed ${joiner.first_name || joinerId}` +
-        (joiner.username ? ` (@${joiner.username})` : '') +
-        ` — used an invite link I don't recognise.`
-      );
-      return;
-    }
-
-    if (record.tgId !== joinerId) {
-      console.error(
-        `Kicking ${joinerId}: used a link issued to ${record.tgId} (@${record.handle}).`
-      );
-      await kickMember(joinerId, joiner.username || joinerId);
-      await notifyAdmins(
-        `🚫 Removed ${joiner.first_name || joinerId}` +
-        (joiner.username ? ` (@${joiner.username})` : '') +
-        ` — used a link that was issued to @${record.handle}.\n\n` +
-        `That link was forwarded. You may want to check on @${record.handle}.`
-      );
-      return;
-    }
-
-    await redis.del(`invite:${usedLink}`);
-  } catch (err) {
-    console.error('chat_member handler failed:', err.message);
   }
-});
+}
 
+// allowed_updates must include chat_member — Telegram does not send it
+// by default, so without this the gatecrasher check never fires.
 bot.launch({
   allowedUpdates: [
     'message',
@@ -404,6 +612,9 @@ app.get('/auth/x/callback', async (req, res) => {
 });
 
 // ---------- Cron endpoint (the daily check) ----------
+//
+// An external free cron service (cron-job.org) calls this once a day.
+// The secret in the URL stops randoms from triggering it.
 
 app.get('/cron/daily-check', async (req, res) => {
   if (req.query.key !== CRON_SECRET) {
@@ -419,6 +630,7 @@ app.get('/cron/daily-check', async (req, res) => {
 
   console.log(`Daily check: checked ${result.checked}, removed ${result.removed.length}`);
 
+  // Tell the admin(s) what happened, but only if someone was removed.
   if (result.removed.length) {
     let msg =
       `Daily check complete.\n` +
@@ -440,6 +652,8 @@ app.get('/cron/daily-check', async (req, res) => {
 });
 
 // ---------- Keepalive ----------
+// The free cron service also pings this every 10 min so Render
+// doesn't put the app to sleep.
 
 app.get('/ping', (req, res) => res.send('pong'));
 
