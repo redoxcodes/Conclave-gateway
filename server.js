@@ -416,6 +416,245 @@ bot.command('showlist', async (ctx) => {
 // /myid — tells you your Telegram user id (useful for setting ADMIN_USER_IDS)
 bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
+// ---------- Admin panel ----------
+//
+// /admin brings up a button panel. Non-admins get refused and never see
+// it, so the panel stays invisible to subscribers.
+
+// Tracks admins mid-flow, e.g. "waiting for a handle to add".
+// In memory only — a restart just clears it, which is fine.
+const awaitingInput = new Map();
+
+function adminPanel() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '📊 Status', callback_data: 'a:status' },
+          { text: '👀 Show list', callback_data: 'a:showlist' },
+        ],
+        [
+          { text: '➕ Add sub', callback_data: 'a:addsub' },
+          { text: '➖ Remove sub', callback_data: 'a:removesub' },
+        ],
+        [
+          { text: '🔍 Look someone up', callback_data: 'a:whois' },
+        ],
+        [
+          { text: '🔄 Run check now', callback_data: 'a:runcheck' },
+        ],
+        [
+          { text: '💾 Export list', callback_data: 'a:export' },
+        ],
+      ],
+    },
+  };
+}
+
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  awaitingInput.delete(String(ctx.from.id));
+
+  return ctx.reply(
+    '⚙️ *Conclave Admin*\n\nPick something below.',
+    { parse_mode: 'Markdown', ...adminPanel() }
+  );
+});
+
+bot.on('callback_query', async (ctx) => {
+  const userId = String(ctx.from.id);
+
+  if (!isAdmin(userId)) {
+    return ctx.answerCbQuery('Not authorized.', { show_alert: true });
+  }
+
+  const action = ctx.callbackQuery.data;
+  if (!action || !action.startsWith('a:')) return ctx.answerCbQuery();
+
+  const what = action.slice(2);
+
+  try {
+    switch (what) {
+      case 'status': {
+        await ctx.answerCbQuery();
+        const activeList = await getActiveList();
+        const members = await getMembers();
+        return ctx.reply(
+          `📊 Verified members: ${members.length}\n` +
+          `📋 Active list: ${activeList.size} handles`,
+          adminPanel()
+        );
+      }
+
+      case 'showlist': {
+        await ctx.answerCbQuery();
+        const activeList = await getActiveList();
+        if (activeList.size === 0) {
+          return ctx.reply('No list saved yet.', adminPanel());
+        }
+        return ctx.reply(
+          `📋 Current list (${activeList.size}):\n` +
+          [...activeList].map((h) => '@' + h).join('\n'),
+          adminPanel()
+        );
+      }
+
+      case 'export': {
+        await ctx.answerCbQuery();
+        const activeList = await getActiveList();
+        if (activeList.size === 0) {
+          return ctx.reply('No list saved yet.', adminPanel());
+        }
+        return ctx.reply(`/setlist\n` + [...activeList].join('\n'));
+      }
+
+      case 'addsub': {
+        await ctx.answerCbQuery();
+        awaitingInput.set(userId, 'addsub');
+        return ctx.reply(
+          '➕ Send me the X handle to add.\n\n(or /cancel to stop)'
+        );
+      }
+
+      case 'removesub': {
+        await ctx.answerCbQuery();
+        awaitingInput.set(userId, 'removesub');
+        return ctx.reply(
+          '➖ Send me the X handle to remove.\n\n(or /cancel to stop)'
+        );
+      }
+
+      case 'whois': {
+        await ctx.answerCbQuery();
+        awaitingInput.set(userId, 'whois');
+        return ctx.reply(
+          '🔍 Send me the X handle to look up.\n\n(or /cancel to stop)'
+        );
+      }
+
+      case 'runcheck': {
+        await ctx.answerCbQuery('Running...');
+        const result = await runCheck();
+        if (result.skipped) return ctx.reply(result.reason, adminPanel());
+
+        let msg =
+          `🔄 Check complete.\n` +
+          `Checked: ${result.checked}\n` +
+          `Removed: ${result.removed.length}`;
+        if (result.removed.length) {
+          msg += '\n\nRemoved: ' + result.removed.map((h) => '@' + h).join(', ');
+        }
+        return ctx.reply(msg, adminPanel());
+      }
+
+      default:
+        return ctx.answerCbQuery();
+    }
+  } catch (err) {
+    console.error('Panel action failed:', err.message);
+    await ctx.answerCbQuery('Something went wrong.');
+    return ctx.reply(`Error: ${err.message}`, adminPanel());
+  }
+});
+
+// Catches the handle an admin sends after tapping a panel button.
+bot.on('text', async (ctx, next) => {
+  const userId = String(ctx.from.id);
+  const waitingFor = awaitingInput.get(userId);
+
+  // Not mid-flow, or it's a command — let the normal handlers deal with it.
+  if (!waitingFor) return next();
+  if (ctx.message.text.startsWith('/')) {
+    awaitingInput.delete(userId);
+    return next();
+  }
+
+  awaitingInput.delete(userId);
+  const handle = normalize(ctx.message.text);
+
+  if (waitingFor === 'addsub') {
+    const activeList = await getActiveList();
+    if (activeList.has(handle)) {
+      return ctx.reply(`@${handle} is already on the list.`, adminPanel());
+    }
+    activeList.add(handle);
+    await saveActiveList(activeList);
+    return ctx.reply(
+      `✅ Added @${handle}.\nList is now ${activeList.size} handles.`,
+      adminPanel()
+    );
+  }
+
+  if (waitingFor === 'removesub') {
+    const activeList = await getActiveList();
+    if (!activeList.has(handle)) {
+      return ctx.reply(`@${handle} isn't on the list.`, adminPanel());
+    }
+    activeList.delete(handle);
+    await saveActiveList(activeList);
+
+    await ctx.reply(
+      `Removed @${handle} from the list (${activeList.size} left). Checking group...`
+    );
+
+    const result = await runCheck();
+    if (result.skipped) return ctx.reply(result.reason, adminPanel());
+
+    if (result.removed.length) {
+      return ctx.reply(
+        `✅ Kicked: ` + result.removed.map((h) => '@' + h).join(', '),
+        adminPanel()
+      );
+    }
+    return ctx.reply(
+      `@${handle} wasn't in the group, so nothing to kick.`,
+      adminPanel()
+    );
+  }
+
+  if (waitingFor === 'whois') {
+    const activeList = await getActiveList();
+    const onList = activeList.has(handle);
+
+    const members = await getMembers();
+    let verifiedAs = null;
+
+    for (const tgId of members) {
+      const record = await redis.get(`verified:${tgId}`);
+      if (record && normalize(record.username) === handle) {
+        verifiedAs = { tgId, ...record };
+        break;
+      }
+    }
+
+    let msg = `🔍 @${handle}\n\n`;
+    msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
+
+    if (verifiedAs) {
+      msg += `✅ Verified (Telegram ID ${verifiedAs.tgId})\n`;
+      msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
+    } else {
+      msg += `❌ Has never verified with the bot\n`;
+    }
+
+    msg += `\n`;
+    if (onList && verifiedAs) {
+      msg += `They should have access. If not, check Removed Users in group settings.`;
+    } else if (onList && !verifiedAs) {
+      msg += `On the list but hasn't verified — tell them to send /start to the bot.`;
+    } else if (!onList && verifiedAs) {
+      msg += `Verified but not on the list. Add them if they've subscribed.`;
+    } else {
+      msg += `Nothing on record for them at all.`;
+    }
+
+    return ctx.reply(msg, adminPanel());
+  }
+
+  return next();
+});
+
 // ---------- Gatecrasher check ----------
 //
 // Fires whenever someone joins. An invite link is single-use, but nothing
