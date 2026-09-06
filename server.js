@@ -444,6 +444,9 @@ function adminPanel() {
           { text: '🔄 Run check now', callback_data: 'a:runcheck' },
         ],
         [
+          { text: '📋 Set full list', callback_data: 'a:setlist' },
+        ],
+        [
           { text: '💾 Export list', callback_data: 'a:export' },
         ],
       ],
@@ -533,6 +536,18 @@ bot.on('callback_query', async (ctx) => {
         );
       }
 
+      case 'setlist': {
+        await ctx.answerCbQuery();
+        awaitingInput.set(userId, 'setlist');
+        const current = await getActiveList();
+        return ctx.reply(
+          `📋 Send me the full list — one X handle per line.\n\n` +
+          `⚠️ This REPLACES the current list (${current.size} handles). ` +
+          `Paste everyone, not just new people.\n\n` +
+          `(or /cancel to stop)`
+        );
+      }
+
       case 'runcheck': {
         await ctx.answerCbQuery('Running...');
         const result = await runCheck();
@@ -571,6 +586,36 @@ bot.on('text', async (ctx, next) => {
   }
 
   awaitingInput.delete(userId);
+
+  // The full-list paste is multi-line, so handle it before we normalise
+  // the message as a single handle.
+  if (waitingFor === 'setlist') {
+    const lines = ctx.message.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (lines.length === 0) {
+      return ctx.reply('Nothing there. Nothing changed.', adminPanel());
+    }
+
+    const handles = new Set(lines.map(normalize));
+    const wouldRemove = await previewRemovals(handles);
+
+    if (wouldRemove.length > BULK_REMOVAL_THRESHOLD) {
+      pendingSetlist.set(userId, handles);
+      return ctx.reply(
+        `⚠️ Hold on — this would remove ${wouldRemove.length} people:\n\n` +
+        wouldRemove.map((h) => '@' + h).join(', ') +
+        `\n\nNew list has ${handles.size} handles.\n\n` +
+        `If that's right, send /confirm. Otherwise /cancel.`
+      );
+    }
+
+    await applySetlist(ctx, handles);
+    return ctx.reply('Done.', adminPanel());
+  }
+
   const handle = normalize(ctx.message.text);
 
   if (waitingFor === 'addsub') {
