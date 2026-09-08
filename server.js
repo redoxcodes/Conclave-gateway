@@ -388,6 +388,77 @@ bot.command('export', async (ctx) => {
 });
 
 // /status — quick health check
+// Remove several handles at once. Unlike /setlist, this only takes away
+// the handles you paste — everyone else on the list stays.
+bot.command('removelist', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const lines = ctx.message.text.split('\n').slice(1).filter((l) => l.trim());
+  if (lines.length === 0) {
+    return ctx.reply(
+      'Send it like this:\n\n/removelist\nhandle1\nhandle2\nhandle3\n\n' +
+      'Only these come off the list. Everyone else stays.'
+    );
+  }
+
+  return applyRemoveList(ctx, lines.map(normalize));
+});
+
+async function applyRemoveList(ctx, toRemove) {
+  const activeList = await getActiveList();
+
+  const removed = [];
+  const notFound = [];
+
+  for (const handle of toRemove) {
+    if (activeList.has(handle)) {
+      activeList.delete(handle);
+      removed.push(handle);
+    } else {
+      notFound.push(handle);
+    }
+  }
+
+  if (removed.length === 0) {
+    return ctx.reply(
+      `None of those were on the list.\n\n` +
+      `Not found: ${notFound.map((h) => '@' + h).join(', ')}`,
+      adminPanel()
+    );
+  }
+
+  await saveActiveList(activeList);
+
+  await ctx.reply(
+    `Took ${removed.length} off the list (${activeList.size} left). ` +
+    `Checking the group...`
+  );
+
+  const result = await runCheck();
+
+  let msg = `✅ Removed from the list:\n` + removed.map((h) => '@' + h).join(', ');
+
+  if (notFound.length) {
+    msg += `\n\n⚠️ Weren't on the list anyway:\n` +
+           notFound.map((h) => '@' + h).join(', ');
+  }
+
+  if (!result.skipped && result.removed.length) {
+    msg += `\n\n👢 Kicked from the group:\n` +
+           result.removed.map((h) => '@' + h).join(', ');
+  } else if (!result.skipped) {
+    msg += `\n\nNone of them were in the group, so nothing to kick.`;
+  }
+
+  if (!result.skipped && result.stuckBanned && result.stuckBanned.length) {
+    msg += `\n\n⚠️ Could not unban these — they cannot rejoin until you ` +
+           `unban them manually:\n` +
+           result.stuckBanned.map((h) => '@' + h).join(', ');
+  }
+
+  return ctx.reply(msg, adminPanel());
+}
+
 bot.command('status', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
 
@@ -445,6 +516,9 @@ function adminPanel() {
         ],
         [
           { text: '📋 Set full list', callback_data: 'a:setlist' },
+        ],
+        [
+          { text: '🗑 Remove several', callback_data: 'a:removelist' },
         ],
         [
           { text: '💾 Export list', callback_data: 'a:export' },
@@ -548,6 +622,16 @@ bot.on('callback_query', async (ctx) => {
         );
       }
 
+      case 'removelist': {
+        await ctx.answerCbQuery();
+        awaitingInput.set(userId, 'removelist');
+        return ctx.reply(
+          `🗑 Send me the handles to remove — one per line.\n\n` +
+          `Only these come off the list. Everyone else stays.\n\n` +
+          `(or /cancel to stop)`
+        );
+      }
+
       case 'runcheck': {
         await ctx.answerCbQuery('Running...');
         const result = await runCheck();
@@ -614,6 +698,19 @@ bot.on('text', async (ctx, next) => {
 
     await applySetlist(ctx, handles);
     return ctx.reply('Done.', adminPanel());
+  }
+
+  if (waitingFor === 'removelist') {
+    const lines = ctx.message.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (lines.length === 0) {
+      return ctx.reply('Nothing there. Nothing changed.', adminPanel());
+    }
+
+    return applyRemoveList(ctx, lines.map(normalize));
   }
 
   const handle = normalize(ctx.message.text);
