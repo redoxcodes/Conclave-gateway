@@ -459,6 +459,53 @@ async function applyRemoveList(ctx, toRemove) {
   return ctx.reply(msg, adminPanel());
 }
 
+// Everyone who has verified through the bot, with their X handle.
+async function buildVerifiedList() {
+  const members = await getMembers();
+  const activeList = await getActiveList();
+  const out = [];
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    const handle = normalize(record.username);
+    out.push({
+      handle,
+      tgId,
+      onList: activeList.has(handle),
+    });
+  }
+
+  out.sort((a, b) => a.handle.localeCompare(b.handle));
+  return out;
+}
+
+bot.command('verified', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+  return ctx.reply(await formatVerified(), { parse_mode: 'Markdown' });
+});
+
+async function formatVerified() {
+  const list = await buildVerifiedList();
+
+  if (list.length === 0) {
+    return 'Nobody has verified through the bot yet.';
+  }
+
+  let msg = `✅ *Verified through the bot* (${list.length})\n\n`;
+  msg += list
+    .map((m) => (m.onList ? '✅ @' : '⚠️ @') + m.handle)
+    .join('\n');
+
+  const offList = list.filter((m) => !m.onList).length;
+  if (offList) {
+    msg += `\n\n⚠️ = verified but no longer on the subscriber list (${offList})`;
+  }
+
+  return msg;
+}
+
 bot.command('status', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
 
@@ -503,6 +550,9 @@ function adminPanel() {
         [
           { text: '📊 Status', callback_data: 'a:status' },
           { text: '👀 Show list', callback_data: 'a:showlist' },
+        ],
+        [
+          { text: '✅ Verified members', callback_data: 'a:verified' },
         ],
         [
           { text: '➕ Add sub', callback_data: 'a:addsub' },
@@ -562,6 +612,14 @@ bot.on('callback_query', async (ctx) => {
           `📋 Active list: ${activeList.size} handles`,
           adminPanel()
         );
+      }
+
+      case 'verified': {
+        await ctx.answerCbQuery();
+        return ctx.reply(await formatVerified(), {
+          parse_mode: 'Markdown',
+          ...adminPanel(),
+        });
       }
 
       case 'showlist': {
