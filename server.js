@@ -384,7 +384,7 @@ bot.command('export', async (ctx) => {
   if (activeList.size === 0) return ctx.reply('No list saved yet.');
 
   // Formatted so you can paste it straight back into /setlist.
-  return ctx.reply(`/setlist\n` + [...activeList].join('\n'));
+  return sendLong(ctx, `/setlist\n` + [...activeList].join('\n'));
 });
 
 // /status — quick health check
@@ -483,7 +483,7 @@ async function buildVerifiedList() {
 
 bot.command('verified', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
-  return ctx.reply(await formatVerified(), { parse_mode: 'Markdown' });
+  return sendLong(ctx, await formatVerified(), { parse_mode: 'Markdown' });
 });
 
 async function formatVerified() {
@@ -525,7 +525,8 @@ bot.command('showlist', async (ctx) => {
   const activeList = await getActiveList();
   if (activeList.size === 0) return ctx.reply('No list saved yet.');
 
-  return ctx.reply(
+  return sendLong(
+    ctx,
     `Current list (${activeList.size}):\n` +
     [...activeList].map((h) => '@' + h).join('\n')
   );
@@ -593,18 +594,18 @@ bot.on('callback_query', async (ctx) => {
   const userId = String(ctx.from.id);
 
   if (!isAdmin(userId)) {
-    return ctx.answerCbQuery('Not authorized.', { show_alert: true });
+    return safeAnswer(ctx, 'Not authorized.');
   }
 
   const action = ctx.callbackQuery.data;
-  if (!action || !action.startsWith('a:')) return ctx.answerCbQuery();
+  if (!action || !action.startsWith('a:')) return safeAnswer(ctx);
 
   const what = action.slice(2);
 
   try {
     switch (what) {
       case 'status': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         const activeList = await getActiveList();
         const members = await getMembers();
         return ctx.reply(
@@ -615,20 +616,21 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'verified': {
-        await ctx.answerCbQuery();
-        return ctx.reply(await formatVerified(), {
+        await safeAnswer(ctx);
+        return sendLong(ctx, await formatVerified(), {
           parse_mode: 'Markdown',
           ...adminPanel(),
         });
       }
 
       case 'showlist': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         const activeList = await getActiveList();
         if (activeList.size === 0) {
           return ctx.reply('No list saved yet.', adminPanel());
         }
-        return ctx.reply(
+        return sendLong(
+          ctx,
           `📋 Current list (${activeList.size}):\n` +
           [...activeList].map((h) => '@' + h).join('\n'),
           adminPanel()
@@ -636,16 +638,16 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'export': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         const activeList = await getActiveList();
         if (activeList.size === 0) {
           return ctx.reply('No list saved yet.', adminPanel());
         }
-        return ctx.reply(`/setlist\n` + [...activeList].join('\n'));
+        return sendLong(ctx, `/setlist\n` + [...activeList].join('\n'));
       }
 
       case 'addsub': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         awaitingInput.set(userId, 'addsub');
         return ctx.reply(
           '➕ Send me the X handle to add.\n\n(or /cancel to stop)'
@@ -653,7 +655,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'removesub': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         awaitingInput.set(userId, 'removesub');
         return ctx.reply(
           '➖ Send me the X handle to remove.\n\n(or /cancel to stop)'
@@ -661,7 +663,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'whois': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         awaitingInput.set(userId, 'whois');
         return ctx.reply(
           '🔍 Send me the X handle to look up.\n\n(or /cancel to stop)'
@@ -669,7 +671,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'setlist': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         awaitingInput.set(userId, 'setlist');
         const current = await getActiveList();
         return ctx.reply(
@@ -681,7 +683,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'removelist': {
-        await ctx.answerCbQuery();
+        await safeAnswer(ctx);
         awaitingInput.set(userId, 'removelist');
         return ctx.reply(
           `🗑 Send me the handles to remove — one per line.\n\n` +
@@ -691,7 +693,7 @@ bot.on('callback_query', async (ctx) => {
       }
 
       case 'runcheck': {
-        await ctx.answerCbQuery('Running...');
+        await safeAnswer(ctx, 'Running...');
         const result = await runCheck();
         if (result.skipped) return ctx.reply(result.reason, adminPanel());
 
@@ -706,11 +708,11 @@ bot.on('callback_query', async (ctx) => {
       }
 
       default:
-        return ctx.answerCbQuery();
+        return safeAnswer(ctx);
     }
   } catch (err) {
     console.error('Panel action failed:', err.message);
-    await ctx.answerCbQuery('Something went wrong.');
+    await safeAnswer(ctx, 'Something went wrong.');
     return ctx.reply(`Error: ${err.message}`, adminPanel());
   }
 });
@@ -1008,6 +1010,47 @@ async function applySetlist(ctx, handles) {
   return ctx.reply(msg);
 }
 
+// Telegram caps messages at 4096 characters. With a few hundred handles
+// we blow past that, so split long replies into several messages.
+const TG_LIMIT = 3800; // leave headroom for formatting
+
+async function sendLong(ctx, text, extra = {}) {
+  if (text.length <= TG_LIMIT) {
+    return ctx.reply(text, extra);
+  }
+
+  const lines = text.split('\n');
+  const chunks = [];
+  let current = '';
+
+  for (const line of lines) {
+    if ((current + line + '\n').length > TG_LIMIT) {
+      if (current) chunks.push(current);
+      current = '';
+    }
+    current += line + '\n';
+  }
+  if (current.trim()) chunks.push(current);
+
+  // Only the last chunk carries the keyboard, so we don't get one per part.
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const label = chunks.length > 1 ? `(${i + 1}/${chunks.length})\n` : '';
+    await ctx.reply(label + chunks[i], isLast ? extra : {});
+    await sleep(300);
+  }
+}
+
+// Answering a callback fails if the query has already expired. That's
+// harmless, but an unhandled throw here kills the process.
+async function safeAnswer(ctx, text) {
+  try {
+    await ctx.answerCbQuery(text);
+  } catch (err) {
+    // Query expired — nothing to do.
+  }
+}
+
 async function notifyAdmins(text) {
   for (const adminId of ADMIN_IDS) {
     try {
@@ -1020,6 +1063,20 @@ async function notifyAdmins(text) {
 
 // allowed_updates must include chat_member — Telegram does not send it
 // by default, so without this the gatecrasher check never fires.
+// A single failed reply used to take the whole process down, which meant
+// the bot went dead until Render restarted it. Catch everything instead.
+bot.catch((err, ctx) => {
+  console.error(`Bot error on ${ctx.updateType}:`, err.message);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason && reason.message ? reason.message : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message);
+});
+
 bot.launch({
   allowedUpdates: [
     'message',
