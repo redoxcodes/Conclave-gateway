@@ -603,6 +603,57 @@ bot.command(['leaderboard', 'top'], async (ctx) => {
   });
 });
 
+// Admin only, run ONCE after the curve was rescaled.
+// Multiplies everyone's existing XP so nobody drops a rank.
+bot.command('rescale', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  // Guard: running this twice would inflate everyone.
+  const alreadyDone = await redis.get('xp_rescaled');
+  if (alreadyDone) {
+    return ctx.reply(
+      `⚠️ Already rescaled on ${alreadyDone}.\n\n` +
+      `Running it again would inflate everyone's XP. Refusing.`
+    );
+  }
+
+  const ids = (await redis.smembers('xp_users')) || [];
+  if (ids.length === 0) {
+    return ctx.reply('Nobody has any XP yet — nothing to rescale.');
+  }
+
+  await ctx.reply(`Rescaling ${ids.length} members by ${RESCALE_FACTOR}x...`);
+
+  const changes = [];
+  let touched = 0;
+
+  for (const id of ids) {
+    const record = await getXpRecord(id);
+    if (!record.xp) continue;
+
+    const before = levelFromXp(record.xp).level;
+    record.xp = Math.round(record.xp * RESCALE_FACTOR);
+    await saveXpRecord(id, record);
+    const after = levelFromXp(record.xp).level;
+
+    touched++;
+    if (before !== after) {
+      changes.push(`${esc(record.name || id)}: Lvl ${before} → ${after}`);
+    }
+  }
+
+  await redis.set('xp_rescaled', new Date().toISOString());
+
+  let msg = `✅ Rescaled ${touched} members.\n\n`;
+  msg += changes.length
+    ? `Levels that shifted:\n${changes.join('\n')}`
+    : `Everyone kept the level they had. 👍`;
+
+  await refreshPinnedBoard().catch(() => {});
+
+  return ctx.reply(msg, { parse_mode: 'HTML' });
+});
+
 // Admin only — post and pin the board in the ASCENSION topic.
 // Run this once; after that it refreshes itself on every rank-up.
 bot.command('pinboard', async (ctx) => {
@@ -1044,7 +1095,7 @@ bot.on('message', async (ctx, next) => {
 // XP per message, with a cooldown so spamming doesn't farm levels.
 // Level 1 is quick; the climb to Conclave Lord is deliberately brutal.
 
-const XP_PER_MESSAGE = 10;
+const XP_PER_MESSAGE = 5;
 const XP_COOLDOWN_MS = 60 * 1000;          // one award per minute, per person
 const LEVEL_CHECK_COOLDOWN_MS = 50 * 1000; // /level rate limit, per person
 const RANKUP_DELETE_AFTER_MS = 15 * 1000;  // tidy up the announcement
@@ -1055,22 +1106,26 @@ const ASCENSION_TOPIC_ID = process.env.ASCENSION_TOPIC_ID || '';
 // Cumulative XP needed to REACH each level. Easy start, steep finish.
 const LEVEL_THRESHOLDS = [
   0,      // level 0
-  50,     // 1
-  230,    // 2
-  570,    // 3
-  1070,   // 4
-  1760,   // 5
-  2630,   // 6
-  3700,   // 7
-  4980,   // 8
-  6450,   // 9
-  8150,   // 10
-  10050,  // 11
-  12200,  // 12
-  14550,  // 13
-  17150,  // 14
-  20000,  // 15 — Conclave Lord
+  75,     // 1
+  345,    // 2
+  855,    // 3
+  1605,   // 4
+  2640,   // 5
+  3945,   // 6
+  5550,   // 7
+  7470,   // 8
+  9675,   // 9
+  12225,  // 10
+  15075,  // 11
+  18300,  // 12
+  21825,  // 13
+  25725,  // 14
+  30000,  // 15 — Conclave Lord
 ];
+
+// When the curve was rescaled, everyone's existing XP was multiplied by
+// this so nobody lost a rank they'd already earned. Used by /rescale.
+const RESCALE_FACTOR = 1.5;
 
 const MAX_LEVEL = LEVEL_THRESHOLDS.length - 1;
 
