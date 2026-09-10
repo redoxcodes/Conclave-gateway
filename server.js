@@ -540,8 +540,14 @@ const levelCheckCooldown = new Map();
 
 // Members check their own standing. ASCENSION topic only.
 bot.command(['level', 'lvl', 'xp'], async (ctx) => {
-  if (String(ctx.chat.id) !== String(TELEGRAM_GROUP_ID)) return;
-  if (!inAscensionTopic(ctx)) return; // wrong topic — stay silent
+  const isDm = ctx.chat.type === 'private';
+  const isOurGroup = String(ctx.chat.id) === String(TELEGRAM_GROUP_ID);
+
+  // Works in the bot's DM, or in the ASCENSION topic. Nowhere else.
+  if (!isDm) {
+    if (!isOurGroup) return;
+    if (!inAscensionTopic(ctx)) return; // wrong topic — stay silent
+  }
 
   const userId = String(ctx.from.id);
   const now = Date.now();
