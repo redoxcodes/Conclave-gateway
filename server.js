@@ -483,7 +483,7 @@ async function buildVerifiedList() {
 
 bot.command('verified', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
-  return sendLong(ctx, await formatVerified(), { parse_mode: 'Markdown' });
+  return sendLong(ctx, await formatVerified(), { parse_mode: 'HTML' });
 });
 
 async function formatVerified() {
@@ -493,9 +493,9 @@ async function formatVerified() {
     return 'Nobody has verified through the bot yet.';
   }
 
-  let msg = `✅ *Verified through the bot* (${list.length})\n\n`;
+  let msg = `✅ <b>Verified through the bot</b> (${list.length})\n\n`;
   msg += list
-    .map((m) => (m.onList ? '✅ @' : '⚠️ @') + m.handle)
+    .map((m) => (m.onList ? '✅ @' : '⚠️ @') + esc(m.handle))
     .join('\n');
 
   const offList = list.filter((m) => !m.onList).length;
@@ -564,11 +564,11 @@ bot.command(['level', 'lvl', 'xp'], async (ctx) => {
 
   if (info.maxed) {
     return ctx.reply(
-      `🔺 *${title}*\n` +
+      `🔺 <b>${title}</b>\n` +
       `Lvl ${info.level} — MAX\n` +
       `██████████\n\n` +
       `${record.xp} XP. You've reached the top.`,
-      { parse_mode: 'Markdown', ...threadOpt }
+      { parse_mode: 'HTML', ...threadOpt }
     );
   }
 
@@ -576,11 +576,11 @@ bot.command(['level', 'lvl', 'xp'], async (ctx) => {
   const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
 
   return ctx.reply(
-    `🔺 *${title}*\n` +
+    `🔺 <b>${title}</b>\n` +
     `Lvl ${info.level}\n` +
     `${bar}  ${info.xpIntoLevel}/${info.xpNeeded}\n\n` +
     `${info.remaining} XP to Lvl ${info.level + 1}.`,
-    { parse_mode: 'Markdown', ...threadOpt }
+    { parse_mode: 'HTML', ...threadOpt }
   );
 });
 
@@ -592,7 +592,7 @@ bot.command(['leaderboard', 'top'], async (ctx) => {
   const thread = ctx.message.message_thread_id;
 
   return ctx.reply(formatLeaderboard(rows), {
-    parse_mode: 'Markdown',
+    parse_mode: 'HTML',
     ...(thread ? { message_thread_id: thread } : {}),
   });
 });
@@ -610,7 +610,7 @@ bot.command('pinboard', async (ctx) => {
 
   try {
     const sent = await ctx.reply(formatLeaderboard(rows), {
-      parse_mode: 'Markdown',
+      parse_mode: 'HTML',
       ...(thread ? { message_thread_id: thread } : {}),
     });
 
@@ -719,7 +719,7 @@ bot.on('callback_query', async (ctx) => {
       case 'verified': {
         await safeAnswer(ctx);
         return sendLong(ctx, await formatVerified(), {
-          parse_mode: 'Markdown',
+          parse_mode: 'HTML',
           ...adminPanel(),
         });
       }
@@ -978,9 +978,9 @@ bot.on('message', async (ctx, next) => {
       const title = rankTitle(newLevel);
 
       const sent = await ctx.reply(
-        `🔺 ${mention} just ascended to *Lvl ${newLevel} — ${title}*`,
+        `🔺 ${esc(mention)} just ascended to <b>Lvl ${newLevel} — ${title}</b>`,
         {
-          parse_mode: 'Markdown',
+          parse_mode: 'HTML',
           ...(msg.message_thread_id
             ? { message_thread_id: msg.message_thread_id }
             : {}),
@@ -1067,6 +1067,15 @@ const LEVEL_THRESHOLDS = [
 ];
 
 const MAX_LEVEL = LEVEL_THRESHOLDS.length - 1;
+
+// Display names can contain characters that break Telegram's parser
+// (underscores, asterisks, angle brackets). Escape them for HTML mode.
+function esc(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
 function rankTitle(level) {
   if (level >= 15) return 'Conclave Lord';
@@ -1162,18 +1171,21 @@ async function buildLeaderboard() {
 
 function formatLeaderboard(rows) {
   if (rows.length === 0) {
-    return '🔺 *ASCENSION*\n\nNobody has earned XP yet.';
+    return '🔺 <b>ASCENSION</b>\n\nNobody has earned XP yet.';
   }
 
   const medals = ['🥇', '🥈', '🥉'];
   const body = rows
     .map((r, i) => {
       const pos = medals[i] || `${String(i + 1).padStart(2, ' ')}.`;
-      return `${pos} ${r.name} — ${rankTitle(r.level)} (Lvl ${r.level})`;
+      return `${pos} ${esc(r.name)} — ${rankTitle(r.level)} (Lvl ${r.level})`;
     })
     .join('\n');
 
-  return `🔺 *ASCENSION — Top 15*\n\n${body}\n\n_Updated ${new Date().toUTCString()}_`;
+  return (
+    `🔺 <b>ASCENSION — Top 15</b>\n\n${body}\n\n` +
+    `<i>Updated ${esc(new Date().toUTCString())}</i>`
+  );
 }
 
 // The pinned board lives at a message id we remember.
@@ -1189,7 +1201,7 @@ async function refreshPinnedBoard() {
       Number(pinnedId),
       undefined,
       formatLeaderboard(rows),
-      { parse_mode: 'Markdown' }
+      { parse_mode: 'HTML' }
     );
   } catch (err) {
     // "message is not modified" is normal when nothing changed.
