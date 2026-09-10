@@ -533,6 +533,107 @@ bot.command('showlist', async (ctx) => {
 });
 
 // /myid — tells you your Telegram user id (useful for setting ADMIN_USER_IDS)
+// ---------- Ascension commands ----------
+
+// Per-person cooldown so people can't spam the check.
+const levelCheckCooldown = new Map();
+
+// Members check their own standing. ASCENSION topic only.
+bot.command(['level', 'lvl', 'xp'], async (ctx) => {
+  if (String(ctx.chat.id) !== String(TELEGRAM_GROUP_ID)) return;
+  if (!inAscensionTopic(ctx)) return; // wrong topic — stay silent
+
+  const userId = String(ctx.from.id);
+  const now = Date.now();
+  const thread = ctx.message.message_thread_id;
+  const threadOpt = thread ? { message_thread_id: thread } : {};
+
+  const lastCheck = levelCheckCooldown.get(userId) || 0;
+  const waited = now - lastCheck;
+
+  if (waited < LEVEL_CHECK_COOLDOWN_MS) {
+    const secondsLeft = Math.ceil((LEVEL_CHECK_COOLDOWN_MS - waited) / 1000);
+    return ctx.reply(`⏳ Wait ${secondsLeft}s before checking again.`, threadOpt);
+  }
+
+  levelCheckCooldown.set(userId, now);
+
+  const record = await getXpRecord(userId);
+  const info = levelFromXp(record.xp);
+  const title = rankTitle(info.level);
+
+  if (info.maxed) {
+    return ctx.reply(
+      `🔺 *${title}*\n` +
+      `Lvl ${info.level} — MAX\n` +
+      `██████████\n\n` +
+      `${record.xp} XP. You've reached the top.`,
+      { parse_mode: 'Markdown', ...threadOpt }
+    );
+  }
+
+  const filled = Math.round((info.xpIntoLevel / info.xpNeeded) * 10);
+  const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+
+  return ctx.reply(
+    `🔺 *${title}*\n` +
+    `Lvl ${info.level}\n` +
+    `${bar}  ${info.xpIntoLevel}/${info.xpNeeded}\n\n` +
+    `${info.remaining} XP to Lvl ${info.level + 1}.`,
+    { parse_mode: 'Markdown', ...threadOpt }
+  );
+});
+
+// Admin only — the board itself is pinned for everyone.
+bot.command(['leaderboard', 'top'], async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const rows = await buildLeaderboard();
+  const thread = ctx.message.message_thread_id;
+
+  return ctx.reply(formatLeaderboard(rows), {
+    parse_mode: 'Markdown',
+    ...(thread ? { message_thread_id: thread } : {}),
+  });
+});
+
+// Admin only — post and pin the board in the ASCENSION topic.
+// Run this once; after that it refreshes itself on every rank-up.
+bot.command('pinboard', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+  if (String(ctx.chat.id) !== String(TELEGRAM_GROUP_ID)) {
+    return ctx.reply('Run this inside the group, in the ASCENSION topic.');
+  }
+
+  const thread = ctx.message.message_thread_id;
+  const rows = await buildLeaderboard();
+
+  try {
+    const sent = await ctx.reply(formatLeaderboard(rows), {
+      parse_mode: 'Markdown',
+      ...(thread ? { message_thread_id: thread } : {}),
+    });
+
+    await ctx.telegram.pinChatMessage(TELEGRAM_GROUP_ID, sent.message_id, {
+      disable_notification: true,
+    });
+
+    await redis.set('ascension_pin', String(sent.message_id));
+
+    return ctx.reply(
+      '✅ Board pinned. It will update itself whenever someone ranks up.',
+      thread ? { message_thread_id: thread } : {}
+    );
+  } catch (err) {
+    console.error('pinboard failed:', err.message);
+    return ctx.reply(
+      `Could not pin: ${err.message}\n\n` +
+      `Check the bot has "Pin Messages" permission.`,
+      thread ? { message_thread_id: thread } : {}
+    );
+  }
+});
+
 bot.command('myid', (ctx) => ctx.reply(`Your Telegram ID: ${ctx.from.id}`));
 
 // ---------- Admin panel ----------
@@ -857,6 +958,54 @@ bot.on('text', async (ctx, next) => {
   return next();
 });
 
+// Award XP for chatting in the group.
+bot.on('message', async (ctx, next) => {
+  try {
+    const msg = ctx.message;
+
+    if (String(msg.chat.id) !== String(TELEGRAM_GROUP_ID)) return next();
+    if (ctx.from.is_bot) return next();
+
+    // Service messages and commands don't earn XP.
+    if (msg.new_chat_members || msg.left_chat_member) return next();
+    if (msg.text && msg.text.startsWith('/')) return next();
+
+    const name = ctx.from.first_name || ctx.from.username || String(ctx.from.id);
+    const newLevel = await awardXp(ctx.from.id, name);
+
+    if (newLevel) {
+      const mention = ctx.from.username ? '@' + ctx.from.username : name;
+      const title = rankTitle(newLevel);
+
+      const sent = await ctx.reply(
+        `🔺 ${mention} just ascended to *Lvl ${newLevel} — ${title}*`,
+        {
+          parse_mode: 'Markdown',
+          ...(msg.message_thread_id
+            ? { message_thread_id: msg.message_thread_id }
+            : {}),
+        }
+      );
+
+      // Keep the pinned board current.
+      refreshPinnedBoard().catch(() => {});
+
+      // Tidy it away so the chat doesn't fill with these.
+      setTimeout(async () => {
+        try {
+          await ctx.telegram.deleteMessage(msg.chat.id, sent.message_id);
+        } catch (err) {
+          console.error('Could not delete rank-up notice:', err.message);
+        }
+      }, RANKUP_DELETE_AFTER_MS);
+    }
+  } catch (err) {
+    console.error('XP handler failed:', err.message);
+  }
+
+  return next();
+});
+
 // Telegram posts "X joined the group" / "X was removed" notices. They
 // pile up fast with a gatekeeper bot, so we delete them after a moment.
 bot.on('message', async (ctx, next) => {
@@ -883,6 +1032,172 @@ bot.on('message', async (ctx, next) => {
 
   return next();
 });
+
+// ---------- Ascension (levels) ----------
+//
+// XP per message, with a cooldown so spamming doesn't farm levels.
+// Level 1 is quick; the climb to Conclave Lord is deliberately brutal.
+
+const XP_PER_MESSAGE = 10;
+const XP_COOLDOWN_MS = 60 * 1000;          // one award per minute, per person
+const LEVEL_CHECK_COOLDOWN_MS = 50 * 1000; // /level rate limit, per person
+const RANKUP_DELETE_AFTER_MS = 15 * 1000;  // tidy up the announcement
+
+// The ASCENSION topic. Level commands only work in here.
+const ASCENSION_TOPIC_ID = process.env.ASCENSION_TOPIC_ID || '';
+
+// Cumulative XP needed to REACH each level. Easy start, steep finish.
+const LEVEL_THRESHOLDS = [
+  0,      // level 0
+  50,     // 1
+  230,    // 2
+  570,    // 3
+  1070,   // 4
+  1760,   // 5
+  2630,   // 6
+  3700,   // 7
+  4980,   // 8
+  6450,   // 9
+  8150,   // 10
+  10050,  // 11
+  12200,  // 12
+  14550,  // 13
+  17150,  // 14
+  20000,  // 15 — Conclave Lord
+];
+
+const MAX_LEVEL = LEVEL_THRESHOLDS.length - 1;
+
+function rankTitle(level) {
+  if (level >= 15) return 'Conclave Lord';
+  if (level >= 13) return 'Archon';
+  if (level >= 10) return 'Elder';
+  if (level >= 7) return 'Adept';
+  if (level >= 4) return 'Acolyte';
+  if (level >= 1) return 'Initiate';
+  return 'Unranked';
+}
+
+function levelFromXp(xp) {
+  let level = 0;
+  for (let i = MAX_LEVEL; i >= 0; i--) {
+    if (xp >= LEVEL_THRESHOLDS[i]) {
+      level = i;
+      break;
+    }
+  }
+
+  if (level >= MAX_LEVEL) {
+    return {
+      level: MAX_LEVEL,
+      maxed: true,
+      xpIntoLevel: 0,
+      xpNeeded: 0,
+      remaining: 0,
+    };
+  }
+
+  const floorXp = LEVEL_THRESHOLDS[level];
+  const nextXp = LEVEL_THRESHOLDS[level + 1];
+
+  return {
+    level,
+    maxed: false,
+    xpIntoLevel: xp - floorXp,
+    xpNeeded: nextXp - floorXp,
+    remaining: nextXp - xp,
+  };
+}
+
+async function getXpRecord(tgId) {
+  const record = await redis.get(`xp:${tgId}`);
+  return record || { xp: 0, lastAward: 0, name: null };
+}
+
+async function saveXpRecord(tgId, record) {
+  await redis.set(`xp:${tgId}`, record);
+  await redis.sadd('xp_users', String(tgId));
+}
+
+// Award XP for a message. Returns the new level if they ranked up.
+async function awardXp(tgId, displayName) {
+  const now = Date.now();
+  const record = await getXpRecord(tgId);
+
+  if (now - (record.lastAward || 0) < XP_COOLDOWN_MS) return null;
+
+  const before = levelFromXp(record.xp).level;
+
+  record.xp += XP_PER_MESSAGE;
+  record.lastAward = now;
+  record.name = displayName;
+  await saveXpRecord(tgId, record);
+
+  const after = levelFromXp(record.xp).level;
+  return after > before ? after : null;
+}
+
+// True if this message is in the ASCENSION topic.
+function inAscensionTopic(ctx) {
+  if (!ASCENSION_TOPIC_ID) return true;
+  const thread = ctx.message && ctx.message.message_thread_id;
+  return String(thread || '') === String(ASCENSION_TOPIC_ID);
+}
+
+// Build the top 15 board.
+async function buildLeaderboard() {
+  const ids = (await redis.smembers('xp_users')) || [];
+  const rows = [];
+
+  for (const id of ids) {
+    const record = await getXpRecord(id);
+    if (!record.xp) continue;
+    const { level } = levelFromXp(record.xp);
+    rows.push({ name: record.name || id, xp: record.xp, level });
+  }
+
+  rows.sort((a, b) => b.xp - a.xp);
+  return rows.slice(0, 15);
+}
+
+function formatLeaderboard(rows) {
+  if (rows.length === 0) {
+    return '🔺 *ASCENSION*\n\nNobody has earned XP yet.';
+  }
+
+  const medals = ['🥇', '🥈', '🥉'];
+  const body = rows
+    .map((r, i) => {
+      const pos = medals[i] || `${String(i + 1).padStart(2, ' ')}.`;
+      return `${pos} ${r.name} — ${rankTitle(r.level)} (Lvl ${r.level})`;
+    })
+    .join('\n');
+
+  return `🔺 *ASCENSION — Top 15*\n\n${body}\n\n_Updated ${new Date().toUTCString()}_`;
+}
+
+// The pinned board lives at a message id we remember.
+async function refreshPinnedBoard() {
+  const pinnedId = await redis.get('ascension_pin');
+  if (!pinnedId) return;
+
+  const rows = await buildLeaderboard();
+
+  try {
+    await bot.telegram.editMessageText(
+      TELEGRAM_GROUP_ID,
+      Number(pinnedId),
+      undefined,
+      formatLeaderboard(rows),
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    // "message is not modified" is normal when nothing changed.
+    if (!err.message.includes('not modified')) {
+      console.error('Could not refresh pinned board:', err.message);
+    }
+  }
+}
 
 // ---------- Gatecrasher check ----------
 //
