@@ -159,6 +159,14 @@ bot.start(async (ctx) => {
       return ctx.reply('⚠️ Verification not found yet. Try tapping the link again.');
     }
 
+    // The OAuth callback only knows their X handle. Now that they're back
+    // in Telegram we can see their TG username too, so store it for /whois.
+    if (String(ctx.from.id) === String(tgId)) {
+      record.tg_username = ctx.from.username || null;
+      record.tg_name = ctx.from.first_name || null;
+      await redis.set(`verified:${tgId}`, record);
+    }
+
     const handle = normalize(record.username);
     const activeList = await getActiveList();
 
@@ -329,6 +337,18 @@ bot.command('removesub', async (ctx) => {
   return ctx.reply(`@${handle} wasn't in the group, so nothing to kick.`);
 });
 
+// Renders the Telegram side of a lookup: username if we have one,
+// otherwise the numeric id (which always works in a tg:// link).
+function telegramLine(record) {
+  if (record.tg_username) {
+    return `Telegram: @${esc(record.tg_username)}`;
+  }
+  if (record.tg_name) {
+    return `Telegram: ${esc(record.tg_name)} (no username set)\nID: ${record.tgId}`;
+  }
+  return `Telegram ID: ${record.tgId} (no username on record)`;
+}
+
 // Look someone up — for when a member says they can't get in.
 bot.command('whois', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
@@ -351,11 +371,12 @@ bot.command('whois', async (ctx) => {
     }
   }
 
-  let msg = `@${handle}\n\n`;
+  let msg = `@${esc(handle)}\n\n`;
   msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
 
   if (verifiedAs) {
-    msg += `✅ Verified (Telegram ID ${verifiedAs.tgId})\n`;
+    msg += `✅ Verified\n`;
+    msg += `${telegramLine(verifiedAs)}\n`;
     msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
   } else {
     msg += `❌ Has never verified with the bot\n`;
@@ -373,7 +394,7 @@ bot.command('whois', async (ctx) => {
     msg += `Nothing on record for them at all.`;
   }
 
-  return ctx.reply(msg);
+  return ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 // Back up the list, in case the database is ever wiped.
@@ -601,6 +622,56 @@ bot.command(['leaderboard', 'top'], async (ctx) => {
     parse_mode: 'HTML',
     ...(thread ? { message_thread_id: thread } : {}),
   });
+});
+
+// Admin only. Fills in Telegram usernames for people who verified before
+// we started storing them. Asks Telegram for each one, so it's slow.
+bot.command('backfillnames', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const members = await getMembers();
+  if (members.length === 0) return ctx.reply('Nobody has verified yet.');
+
+  await ctx.reply(
+    `Looking up ${members.length} members... this takes a moment.`
+  );
+
+  let filled = 0;
+  let alreadyHad = 0;
+  let failed = 0;
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    if (record.tg_username) {
+      alreadyHad++;
+      continue;
+    }
+
+    try {
+      const member = await bot.telegram.getChatMember(
+        TELEGRAM_GROUP_ID,
+        Number(tgId)
+      );
+      record.tg_username = member.user.username || null;
+      record.tg_name = member.user.first_name || null;
+      await redis.set(`verified:${tgId}`, record);
+      if (record.tg_username) filled++;
+    } catch (err) {
+      // Usually means they left the group, so Telegram won't tell us.
+      failed++;
+    }
+
+    await sleep(150); // stay under rate limits
+  }
+
+  return ctx.reply(
+    `✅ Done.\n\n` +
+    `Filled in: ${filled}\n` +
+    `Already had one: ${alreadyHad}\n` +
+    `Couldn't look up: ${failed} (likely left the group)`
+  );
 });
 
 // Admin only, run ONCE after the curve was rescaled.
@@ -988,11 +1059,12 @@ bot.on('text', async (ctx, next) => {
       }
     }
 
-    let msg = `🔍 @${handle}\n\n`;
+    let msg = `🔍 @${esc(handle)}\n\n`;
     msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
 
     if (verifiedAs) {
-      msg += `✅ Verified (Telegram ID ${verifiedAs.tgId})\n`;
+      msg += `✅ Verified\n`;
+      msg += `${telegramLine(verifiedAs)}\n`;
       msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
     } else {
       msg += `❌ Has never verified with the bot\n`;
@@ -1009,7 +1081,7 @@ bot.on('text', async (ctx, next) => {
       msg += `Nothing on record for them at all.`;
     }
 
-    return ctx.reply(msg, adminPanel());
+    return ctx.reply(msg, { parse_mode: 'HTML', ...adminPanel() });
   }
 
   return next();
