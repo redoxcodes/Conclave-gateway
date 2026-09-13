@@ -337,6 +337,32 @@ bot.command('removesub', async (ctx) => {
   return ctx.reply(`@${handle} wasn't in the group, so nothing to kick.`);
 });
 
+// Find someone by either their X handle or their Telegram username.
+// Returns { record, matchedBy } or null.
+async function findMember(query) {
+  const q = normalize(query);
+  const members = await getMembers();
+
+  let tgMatch = null;
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    // X handle is the primary key, so prefer it.
+    if (normalize(record.username) === q) {
+      return { record: { tgId, ...record }, matchedBy: 'x' };
+    }
+
+    // Remember a Telegram match but keep looking for an X one.
+    if (record.tg_username && normalize(record.tg_username) === q) {
+      tgMatch = { record: { tgId, ...record }, matchedBy: 'telegram' };
+    }
+  }
+
+  return tgMatch;
+}
+
 // Renders the Telegram side of a lookup: username if we have one,
 // otherwise the numeric id (which always works in a tg:// link).
 function telegramLine(record) {
@@ -349,52 +375,61 @@ function telegramLine(record) {
   return `Telegram ID: ${record.tgId} (no username on record)`;
 }
 
+// Build the lookup result for either entry point.
+async function formatWhois(query) {
+  const q = normalize(query);
+  const activeList = await getActiveList();
+  const found = await findMember(q);
+
+  // Nothing at all under that name.
+  if (!found) {
+    const onList = activeList.has(q);
+    let msg = `🔍 @${esc(q)}\n\n`;
+    msg += onList
+      ? `✅ On the subscriber list\n❌ Has never verified with the bot\n\n` +
+        `Tell them to send /start to the bot.`
+      : `❌ Not on the subscriber list\n❌ Has never verified with the bot\n\n` +
+        `Nothing on record under that name — as an X handle or a Telegram one.`;
+    return msg;
+  }
+
+  const r = found.record;
+  const xHandle = normalize(r.username);
+  const onList = activeList.has(xHandle);
+
+  let msg = `🔍 @${esc(xHandle)}`;
+  if (found.matchedBy === 'telegram') {
+    msg += `\n<i>(found via Telegram @${esc(r.tg_username)})</i>`;
+  }
+  msg += `\n\n`;
+
+  msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
+  msg += `✅ Verified\n`;
+  msg += `${telegramLine(r)}\n`;
+  msg += `Verified on ${new Date(r.verifiedAt).toDateString()}\n\n`;
+
+  if (onList) {
+    msg += `They should have access. If not, check Removed Users in group settings.`;
+  } else {
+    msg += `Verified but not on the list. Use /addsub ${esc(xHandle)} if they've subscribed.`;
+  }
+
+  return msg;
+}
+
 // Look someone up — for when a member says they can't get in.
 bot.command('whois', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
 
   const arg = ctx.message.text.split(' ')[1];
-  if (!arg) return ctx.reply('Usage: /whois their_x_handle');
-
-  const handle = normalize(arg);
-  const activeList = await getActiveList();
-  const onList = activeList.has(handle);
-
-  const members = await getMembers();
-  let verifiedAs = null;
-
-  for (const tgId of members) {
-    const record = await redis.get(`verified:${tgId}`);
-    if (record && normalize(record.username) === handle) {
-      verifiedAs = { tgId, ...record };
-      break;
-    }
+  if (!arg) {
+    return ctx.reply(
+      'Usage: /whois handle\n\n' +
+      'Works with either their X handle or their Telegram username.'
+    );
   }
 
-  let msg = `@${esc(handle)}\n\n`;
-  msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
-
-  if (verifiedAs) {
-    msg += `✅ Verified\n`;
-    msg += `${telegramLine(verifiedAs)}\n`;
-    msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
-  } else {
-    msg += `❌ Has never verified with the bot\n`;
-  }
-
-  msg += `\n`;
-  if (onList && verifiedAs) {
-    msg += `They should have access. If they don't, check they aren't in ` +
-           `Removed Users in group settings.`;
-  } else if (onList && !verifiedAs) {
-    msg += `On the list but hasn't verified — tell them to send /start to the bot.`;
-  } else if (!onList && verifiedAs) {
-    msg += `Verified but not on the list. Use /addsub ${handle} if they've subscribed.`;
-  } else {
-    msg += `Nothing on record for them at all.`;
-  }
-
-  return ctx.reply(msg, { parse_mode: 'HTML' });
+  return ctx.reply(await formatWhois(arg), { parse_mode: 'HTML' });
 });
 
 // Back up the list, in case the database is ever wiped.
@@ -895,7 +930,9 @@ bot.on('callback_query', async (ctx) => {
         await safeAnswer(ctx);
         awaitingInput.set(userId, 'whois');
         return ctx.reply(
-          '🔍 Send me the X handle to look up.\n\n(or /cancel to stop)'
+          '🔍 Send me a handle to look up.\n\n' +
+          'Works with their X handle or their Telegram username.\n\n' +
+          '(or /cancel to stop)'
         );
       }
 
@@ -1045,43 +1082,10 @@ bot.on('text', async (ctx, next) => {
   }
 
   if (waitingFor === 'whois') {
-    const activeList = await getActiveList();
-    const onList = activeList.has(handle);
-
-    const members = await getMembers();
-    let verifiedAs = null;
-
-    for (const tgId of members) {
-      const record = await redis.get(`verified:${tgId}`);
-      if (record && normalize(record.username) === handle) {
-        verifiedAs = { tgId, ...record };
-        break;
-      }
-    }
-
-    let msg = `🔍 @${esc(handle)}\n\n`;
-    msg += onList ? `✅ On the subscriber list\n` : `❌ Not on the subscriber list\n`;
-
-    if (verifiedAs) {
-      msg += `✅ Verified\n`;
-      msg += `${telegramLine(verifiedAs)}\n`;
-      msg += `Verified on ${new Date(verifiedAs.verifiedAt).toDateString()}\n`;
-    } else {
-      msg += `❌ Has never verified with the bot\n`;
-    }
-
-    msg += `\n`;
-    if (onList && verifiedAs) {
-      msg += `They should have access. If not, check Removed Users in group settings.`;
-    } else if (onList && !verifiedAs) {
-      msg += `On the list but hasn't verified — tell them to send /start to the bot.`;
-    } else if (!onList && verifiedAs) {
-      msg += `Verified but not on the list. Add them if they've subscribed.`;
-    } else {
-      msg += `Nothing on record for them at all.`;
-    }
-
-    return ctx.reply(msg, { parse_mode: 'HTML', ...adminPanel() });
+    return ctx.reply(await formatWhois(handle), {
+      parse_mode: 'HTML',
+      ...adminPanel(),
+    });
   }
 
   return next();
