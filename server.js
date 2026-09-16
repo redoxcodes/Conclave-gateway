@@ -57,14 +57,31 @@ async function saveActiveList(handles) {
   await redis.set('active_list', [...handles]);
 }
 
-// We keep a set of every tg_id that has verified, so the daily check
-// knows who to loop through.
+// 'members' is the PERMANENT registry — everyone who has ever verified.
+// Never removed from, so /whois and /verified can still find someone
+// after they've left. The daily check and /setlist logic reads this.
 async function addMember(tgId) {
   await redis.sadd('members', String(tgId));
 }
 
 async function getMembers() {
   return (await redis.smembers('members')) || [];
+}
+
+// 'active_members' tracks who is CURRENTLY in the group. Added when a
+// fresh invite link is issued, removed the moment they leave or get
+// kicked — by the bot or anyone else. /tenure and /status read this,
+// so people who are no longer in the group never show up in them.
+async function markActive(tgId) {
+  await redis.sadd('active_members', String(tgId));
+}
+
+async function markInactive(tgId) {
+  await redis.srem('active_members', String(tgId));
+}
+
+async function getActiveMembers() {
+  return (await redis.smembers('active_members')) || [];
 }
 
 // When we mint an invite link we remember who it was for, so that when
@@ -89,13 +106,16 @@ async function lookupInvite(inviteLink) {
 // back in, so retry a few times before giving up.
 async function kickMember(tgId, handle) {
   // Tenure resets the moment someone is removed — whatever happens
-  // next, "how long have they been in" starts over from zero.
+  // next, "how long have they been in" starts over from zero. They also
+  // drop out of active_members, so they stop showing in /tenure entirely
+  // until they rejoin.
   try {
     const record = await redis.get(`verified:${tgId}`);
     if (record) {
       record.tenureSince = null;
       await redis.set(`verified:${tgId}`, record);
     }
+    await markInactive(tgId);
   } catch (err) {
     console.error(`Could not reset tenure for ${tgId}:`, err.message);
   }
@@ -206,6 +226,7 @@ bot.start(async (ctx) => {
       });
 
       await addMember(tgId);
+      await markActive(tgId);
       await rememberInvite(invite.invite_link, tgId, handle);
 
       // If tenure was never set, or was cleared by a kick, this link is
@@ -592,7 +613,7 @@ function formatDuration(ms) {
 }
 
 async function buildTenureReport() {
-  const members = await getMembers();
+  const members = await getActiveMembers();
   if (members.length === 0) return null;
 
   const now = Date.now();
@@ -786,6 +807,44 @@ bot.command('backfillnames', async (ctx) => {
     `Filled in: ${filled}\n` +
     `Already had one: ${alreadyHad}\n` +
     `Couldn't look up: ${failed} (likely left the group)`
+  );
+});
+
+// Admin only, run ONCE. active_members starts empty, so this checks
+// everyone in the permanent registry against who's actually still in
+// the group right now, and seeds active_members correctly.
+bot.command('backfillactive', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const members = await getMembers();
+  if (members.length === 0) return ctx.reply('Nobody has verified yet.');
+
+  await ctx.reply(`Checking ${members.length} people are still in the group...`);
+
+  let active = 0;
+  let inactive = 0;
+
+  for (const tgId of members) {
+    try {
+      const m = await bot.telegram.getChatMember(TELEGRAM_GROUP_ID, Number(tgId));
+      if (['member', 'administrator', 'creator'].includes(m.status)) {
+        await markActive(tgId);
+        active++;
+      } else {
+        await markInactive(tgId);
+        inactive++;
+      }
+    } catch (err) {
+      // Telegram can't find them in the chat at all — treat as gone.
+      await markInactive(tgId);
+      inactive++;
+    }
+    await sleep(150);
+  }
+
+  return ctx.reply(
+    `✅ Done.\n\nCurrently in the group: ${active}\nNo longer in it: ${inactive}\n\n` +
+    `/tenure will now only show the ${active} still here.`
   );
 });
 
@@ -1488,7 +1547,17 @@ bot.on('chat_member', async (ctx) => {
       update.new_chat_member.status
     );
 
-    // Only care about someone newly joining.
+    // Someone left or was removed — by us, by another admin, or by
+    // themselves. Either way, they're no longer "active" for tenure
+    // purposes. This does NOT touch the permanent 'members' registry,
+    // so /whois still finds them.
+    if (wasIn && !isIn) {
+      const leaverId = String(update.new_chat_member.user.id);
+      await markInactive(leaverId).catch(() => {});
+      return;
+    }
+
+    // From here on, only care about someone newly joining.
     if (wasIn || !isIn) return;
 
     const joiner = update.new_chat_member.user;
