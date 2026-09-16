@@ -88,6 +88,18 @@ async function lookupInvite(inviteLink) {
 // resubscribe. If that unban fails they stay banned and can never get
 // back in, so retry a few times before giving up.
 async function kickMember(tgId, handle) {
+  // Tenure resets the moment someone is removed — whatever happens
+  // next, "how long have they been in" starts over from zero.
+  try {
+    const record = await redis.get(`verified:${tgId}`);
+    if (record) {
+      record.tenureSince = null;
+      await redis.set(`verified:${tgId}`, record);
+    }
+  } catch (err) {
+    console.error(`Could not reset tenure for ${tgId}:`, err.message);
+  }
+
   await bot.telegram.banChatMember(TELEGRAM_GROUP_ID, Number(tgId));
 
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -195,6 +207,13 @@ bot.start(async (ctx) => {
 
       await addMember(tgId);
       await rememberInvite(invite.invite_link, tgId, handle);
+
+      // If tenure was never set, or was cleared by a kick, this link is
+      // the moment their fresh stay begins.
+      if (!record.tenureSince) {
+        record.tenureSince = Date.now();
+        await redis.set(`verified:${tgId}`, record);
+      }
 
       return ctx.reply(
         `✅ Verified as @${record.username} — you're on the list!\n\n` +
@@ -562,6 +581,67 @@ async function formatVerified() {
   return msg;
 }
 
+// How long since tenureSince, in plain words.
+function formatDuration(ms) {
+  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+  if (days >= 1) return `${days}d`;
+  const hours = Math.floor(ms / (1000 * 60 * 60));
+  if (hours >= 1) return `${hours}h`;
+  const mins = Math.floor(ms / (1000 * 60));
+  return `${mins}m`;
+}
+
+async function buildTenureReport() {
+  const members = await getMembers();
+  if (members.length === 0) return null;
+
+  const now = Date.now();
+  const rows = [];
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    const label = record.tg_username
+      ? '@' + record.tg_username
+      : (record.tg_name || record.username || tgId);
+
+    rows.push({
+      label,
+      xHandle: record.username,
+      since: record.tenureSince || null,
+      ms: record.tenureSince ? now - record.tenureSince : -1,
+    });
+  }
+
+  // Longest tenure first; anyone with no tenure (recently kicked) goes
+  // to the bottom rather than sorting as "oldest".
+  rows.sort((a, b) => b.ms - a.ms);
+
+  const body = rows
+    .map((r) => {
+      const dur = r.since ? formatDuration(r.ms) : '—';
+      return `${dur.padStart(4, ' ')}  ${esc(r.label)} (@${esc(r.xHandle)})`;
+    })
+    .join('\n');
+
+  return (
+    `📅 <b>Tenure</b> (${rows.length}) — longest-standing first\n\n${body}\n\n` +
+    `<i>— resets to 0 if they were ever removed and haven't rejoined yet</i>`
+  );
+}
+
+// Full list, longest-standing first. Anyone kicked shows 0 until they
+// rejoin and get a fresh invite link.
+bot.command('tenure', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const report = await buildTenureReport();
+  if (!report) return ctx.reply('Nobody has verified yet.');
+
+  return sendLong(ctx, report, { parse_mode: 'HTML' });
+});
+
 bot.command('status', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
 
@@ -709,6 +789,39 @@ bot.command('backfillnames', async (ctx) => {
   );
 });
 
+// Admin only, run ONCE. Existing members have no tenureSince yet, so
+// this backfills it from their original verifiedAt as a best estimate.
+// Never overwrites a tenureSince that's already set.
+bot.command('backfilltenure', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Not authorized.');
+
+  const members = await getMembers();
+  if (members.length === 0) return ctx.reply('Nobody has verified yet.');
+
+  let filled = 0;
+  let alreadyHad = 0;
+
+  for (const tgId of members) {
+    const record = await redis.get(`verified:${tgId}`);
+    if (!record) continue;
+
+    if (record.tenureSince) {
+      alreadyHad++;
+      continue;
+    }
+
+    record.tenureSince = record.verifiedAt || Date.now();
+    await redis.set(`verified:${tgId}`, record);
+    filled++;
+  }
+
+  return ctx.reply(
+    `✅ Done.\n\nFilled in: ${filled}\nAlready had one: ${alreadyHad}\n\n` +
+    `Note: this uses their original verification date as an estimate, ` +
+    `since tenure wasn't tracked before now.`
+  );
+});
+
 // Admin only, run ONCE after the curve was rescaled.
 // Multiplies everyone's existing XP so nobody drops a rank.
 bot.command('rescale', async (ctx) => {
@@ -818,6 +931,7 @@ function adminPanel() {
         ],
         [
           { text: '✅ Verified members', callback_data: 'a:verified' },
+          { text: '📅 Tenure', callback_data: 'a:tenure' },
         ],
         [
           { text: '➕ Add sub', callback_data: 'a:addsub' },
@@ -885,6 +999,13 @@ bot.on('callback_query', async (ctx) => {
           parse_mode: 'HTML',
           ...adminPanel(),
         });
+      }
+
+      case 'tenure': {
+        await safeAnswer(ctx);
+        const report = await buildTenureReport();
+        if (!report) return ctx.reply('Nobody has verified yet.', adminPanel());
+        return sendLong(ctx, report, { parse_mode: 'HTML', ...adminPanel() });
       }
 
       case 'showlist': {
@@ -1584,7 +1705,12 @@ app.get('/auth/x/callback', async (req, res) => {
 
     const { data: user } = await loggedClient.v2.me();
 
+    // Preserve tg fields and tenure from any prior record — OAuth only
+    // tells us the X side, and a re-verify shouldn't wipe those out.
+    const existing = (await redis.get(`verified:${tgId}`)) || {};
+
     await redis.set(`verified:${tgId}`, {
+      ...existing,
       x_user_id: user.id,
       username: user.username,
       verifiedAt: Date.now(),
